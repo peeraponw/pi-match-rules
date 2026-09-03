@@ -1,7 +1,7 @@
 {
   "name": "pi-match-rules",
   "version": "0.1.1",
-  "description": "A pi extension that loads Markdown rules from global and project-local .claude/rules directories and injects the relevant rules into pi's system prompt.",
+  "description": "A pi extension that syncs Claude Code rules and settings.json hooks into pi: loads Markdown rules from global and project-local .claude/rules directories, and runs Claude hook commands on the matching pi events.",
   "keywords": [
     "pi-package"
   ],
@@ -9,13 +9,14 @@
   "type": "module",
   "files": [
     "index.ts",
+    "hooks.ts",
     "README.md"
   ],
   "scripts": {
     "clean": "echo 'nothing to clean'",
     "build": "echo 'nothing to build — pi loads index.ts directly'",
     "check": "tsc --noEmit",
-    "test": "node --test index.test.ts"
+    "test": "node --test index.test.ts hooks.test.ts"
   },
   "pi": {
     "extensions": [
@@ -26,6 +27,7 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.4",
     "@types/node": "24.12.4",
     "typescript": "5.9.3"
   }

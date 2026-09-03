@@ -2,6 +2,29 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	type HookDecision,
+	type HookDefinition,
+	type LoadedHooks,
+	type ToolResultContent,
+	aggregateHookDecisions,
+	buildHookPayload,
+	claudeCompactTrigger,
+	claudeSessionEndReason,
+	claudeSessionStartSource,
+	claudeToolName,
+	describeHooks,
+	fromClaudeToolInput,
+	getHookSettingsFiles,
+	hookMatcherMatches,
+	interpretHookOutcome,
+	loadHookSettings,
+	runHookCommand,
+	textOfContent,
+	toClaudeToolInput,
+	toClaudeToolResponse,
+	toolNamesForHookMatcher,
+} from "./hooks.ts";
 
 type FrontmatterValue = boolean | string | string[];
 type Frontmatter = Record<string, FrontmatterValue>;
@@ -388,6 +411,24 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 		overridden: [],
 	};
 	let rules: Rule[] = [];
+	let loadedHooks: LoadedHooks = {
+		hooks: [],
+		sourceFiles: [],
+		disabled: false,
+		unmappedEvents: [],
+		skippedHandlers: 0,
+		errors: [],
+	};
+	// Context queued by SessionStart hooks, flushed into the first prompt.
+	let sessionContextQueue: string[] = [];
+	// PreToolUse additionalContext, appended to the matching tool result.
+	const pendingToolContext = new Map<string, string>();
+
+	type HookBridgeContext = {
+		cwd: string;
+		ui: { notify(message: string, type?: "info" | "warning" | "error"): void };
+		sessionManager: { getSessionId(): string; getSessionFile(): string | undefined };
+	};
 
 	function reloadRules(cwd: string): string {
 		loadedRules = loadMergedRules(cwd);
@@ -395,7 +436,69 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 		return describeRules(loadedRules);
 	}
 
-	pi.on("session_start", async (_event, ctx) => {
+	function reloadHooks(cwd: string): LoadedHooks {
+		loadedHooks = loadHookSettings(getHookSettingsFiles(cwd));
+		return loadedHooks;
+	}
+
+	function hooksFor(claudeEvent: string): HookDefinition[] {
+		return loadedHooks.hooks.filter((hook) => hook.event === claudeEvent);
+	}
+
+	function surfaceDecision(
+		decision: HookDecision,
+		ctx: { ui: { notify(message: string, type?: "info" | "warning" | "error"): void } },
+		claudeEvent: string,
+	): void {
+		if (decision.systemMessage !== undefined) {
+			ctx.ui.notify(decision.systemMessage, "warning");
+		}
+		for (const note of decision.notifications) {
+			ctx.ui.notify(`claude-hooks ${claudeEvent}: ${note}`, "warning");
+		}
+	}
+
+	async function runClaudeHookSet(
+		definitions: HookDefinition[],
+		claudeEvent: string,
+		extra: Record<string, unknown>,
+		ctx: HookBridgeContext,
+	): Promise<HookDecision> {
+		if (loadedHooks.disabled || definitions.length === 0) {
+			return aggregateHookDecisions([]);
+		}
+		const payload = buildHookPayload(
+			{
+				sessionId: ctx.sessionManager.getSessionId(),
+				transcriptPath: ctx.sessionManager.getSessionFile(),
+				cwd: ctx.cwd,
+			},
+			claudeEvent,
+			extra,
+		);
+		// Claude runs all matching hooks in parallel.
+		const outcomes = await Promise.all(
+			definitions.map((definition) => runHookCommand(definition.spec, payload, ctx.cwd)),
+		);
+		return aggregateHookDecisions(
+			outcomes.map((outcome) => interpretHookOutcome(claudeEvent, outcome)),
+		);
+	}
+
+	function lastAssistantText(messages: unknown[]): string {
+		for (let index = messages.length - 1; index >= 0; index--) {
+			const message = messages[index] as { role?: string; content?: unknown } | null;
+			if (message === null || typeof message !== "object" || message.role !== "assistant") {
+				continue;
+			}
+			const content = message.content;
+			if (!Array.isArray(content)) return "";
+			return textOfContent(content as ToolResultContent);
+		}
+		return "";
+	}
+
+	pi.on("session_start", async (event, ctx) => {
 		try {
 			const summary = reloadRules(ctx.cwd);
 			ctx.ui.setStatus("claude-rules", `${rules.length} rules`);
@@ -403,26 +506,235 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 		} catch (error) {
 			ctx.ui.notify(`Failed to load Claude rules: ${(error as Error).message}`, "error");
 		}
+
+		reloadHooks(ctx.cwd);
+		ctx.ui.setStatus(
+			"claude-hooks",
+			loadedHooks.disabled ? "off" : `${loadedHooks.hooks.length} hooks`,
+		);
+		const source = claudeSessionStartSource(event.reason);
+		const sessionDefs = hooksFor("SessionStart").filter((hook) =>
+			hookMatcherMatches(hook.matcher, [source]),
+		);
+		if (sessionDefs.length > 0 && !loadedHooks.disabled) {
+			try {
+				const decision = await runClaudeHookSet(sessionDefs, "SessionStart", { source }, ctx);
+				surfaceDecision(decision, ctx, "SessionStart");
+				if (decision.contextText !== undefined) sessionContextQueue.push(decision.contextText);
+			} catch (error) {
+				ctx.ui.notify(`claude-hooks SessionStart failed: ${(error as Error).message}`, "error");
+			}
+		}
 	});
 
-	pi.on("before_agent_start", async (event) => {
-		if (rules.length === 0) return;
+	pi.on("before_agent_start", async (event, ctx) => {
+		let systemPrompt: string | undefined;
+		if (rules.length > 0) {
+			const candidates = extractPathCandidates(event.prompt);
+			const activeRules = matchingRules(rules, candidates);
+			if (activeRules.length > 0) {
+				const reason = candidates.length > 0
+					? `matched prompt paths: ${candidates.join(", ")}`
+					: "alwaysApply rules";
+				systemPrompt =
+					event.systemPrompt +
+					"\n\n" +
+					formatRulesForPrompt(activeRules, reason) +
+					formatRuleIndex(rules);
+			}
+		}
 
-		const candidates = extractPathCandidates(event.prompt);
-		const activeRules = matchingRules(rules, candidates);
-		if (activeRules.length === 0) return;
+		// UserPromptSubmit hooks, plus context queued by SessionStart hooks.
+		const contextParts = [...sessionContextQueue];
+		sessionContextQueue = [];
+		const promptDefs = hooksFor("UserPromptSubmit");
+		if (promptDefs.length > 0 && !loadedHooks.disabled) {
+			try {
+				const decision = await runClaudeHookSet(
+					promptDefs,
+					"UserPromptSubmit",
+					{ prompt: event.prompt },
+					ctx,
+				);
+				surfaceDecision(decision, ctx, "UserPromptSubmit");
+				if (decision.contextText !== undefined) contextParts.push(decision.contextText);
+			} catch (error) {
+				ctx.ui.notify(
+					`claude-hooks UserPromptSubmit failed: ${(error as Error).message}`,
+					"error",
+				);
+			}
+		}
+		const message =
+			contextParts.length > 0
+				? { customType: "claude-hooks", content: contextParts.join("\n\n"), display: false }
+				: undefined;
 
-		const reason = candidates.length > 0
-			? `matched prompt paths: ${candidates.join(", ")}`
-			: "alwaysApply rules";
-
+		if (systemPrompt === undefined && message === undefined) return;
 		return {
-			systemPrompt:
-				event.systemPrompt +
-				"\n\n" +
-				formatRulesForPrompt(activeRules, reason) +
-				formatRuleIndex(rules),
+			...(systemPrompt !== undefined ? { systemPrompt } : {}),
+			...(message !== undefined ? { message } : {}),
 		};
+	});
+
+	pi.on("tool_call", async (event, ctx) => {
+		if (loadedHooks.disabled) return;
+		const defs = hooksFor("PreToolUse").filter((hook) =>
+			hookMatcherMatches(hook.matcher, toolNamesForHookMatcher(event.toolName)),
+		);
+		if (defs.length === 0) return;
+
+		let decision: HookDecision;
+		try {
+			decision = await runClaudeHookSet(
+				defs,
+				"PreToolUse",
+				{
+					tool_name: claudeToolName(event.toolName),
+					tool_input: toClaudeToolInput(event.toolName, event.input as Record<string, unknown>),
+					tool_use_id: event.toolCallId,
+				},
+				ctx,
+			);
+		} catch (error) {
+			ctx.ui.notify(`claude-hooks PreToolUse failed: ${(error as Error).message}`, "error");
+			return;
+		}
+		surfaceDecision(decision, ctx, "PreToolUse");
+
+		if (
+			decision.updatedInput !== undefined &&
+			decision.blockReason === undefined &&
+			decision.askReason === undefined
+		) {
+			const translated = fromClaudeToolInput(event.toolName, decision.updatedInput);
+			const input = event.input as Record<string, unknown>;
+			for (const key of Object.keys(input)) delete input[key];
+			Object.assign(input, translated);
+		}
+		if (decision.resultAppendix !== undefined) {
+			pendingToolContext.set(event.toolCallId, decision.resultAppendix);
+		}
+		if (decision.blockReason !== undefined) {
+			return { block: true, reason: decision.blockReason };
+		}
+		if (decision.askReason !== undefined && ctx.hasUI) {
+			const allowed = await ctx.ui.confirm(
+				"Claude hook",
+				`${decision.askReason}\n\nAllow this ${event.toolName} call?`,
+			);
+			if (!allowed) return { block: true, reason: decision.askReason };
+		}
+	});
+
+	pi.on("tool_result", async (event, ctx) => {
+		if (loadedHooks.disabled) return;
+		const claudeEvent = event.isError ? "PostToolUseFailure" : "PostToolUse";
+		const defs = hooksFor(claudeEvent).filter((hook) =>
+			hookMatcherMatches(hook.matcher, toolNamesForHookMatcher(event.toolName)),
+		);
+		const preToolContext = pendingToolContext.get(event.toolCallId);
+		pendingToolContext.delete(event.toolCallId);
+		if (defs.length === 0 && preToolContext === undefined) return;
+
+		const input = event.input as Record<string, unknown>;
+		const content = event.content;
+		let appendix = preToolContext ?? "";
+		let markError = false;
+		if (defs.length > 0) {
+			const extra: Record<string, unknown> = {
+				tool_name: claudeToolName(event.toolName),
+				tool_input: toClaudeToolInput(event.toolName, input),
+				tool_use_id: event.toolCallId,
+			};
+			if (event.isError) {
+				extra.error = textOfContent(content);
+				extra.is_interrupt = false;
+			} else {
+				extra.tool_response = toClaudeToolResponse(event.toolName, input, content, event.isError);
+			}
+			try {
+				const decision = await runClaudeHookSet(defs, claudeEvent, extra, ctx);
+				surfaceDecision(decision, ctx, claudeEvent);
+				if (decision.resultAppendix !== undefined) {
+					appendix = appendix === "" ? decision.resultAppendix : `${appendix}\n\n${decision.resultAppendix}`;
+				}
+				markError = decision.markResultError;
+			} catch (error) {
+				ctx.ui.notify(`claude-hooks ${claudeEvent} failed: ${(error as Error).message}`, "error");
+			}
+		}
+		if (appendix === "") return;
+		return {
+			content: [...content, { type: "text", text: `\n[Claude hook feedback]\n${appendix}` }],
+			...(markError ? { isError: true } : {}),
+		};
+	});
+
+	pi.on("agent_end", async (event, ctx) => {
+		if (loadedHooks.disabled) return;
+		const defs = hooksFor("Stop");
+		if (defs.length === 0) return;
+		try {
+			const decision = await runClaudeHookSet(
+				defs,
+				"Stop",
+				{ stop_hook_active: false, last_assistant_message: lastAssistantText(event.messages) },
+				ctx,
+			);
+			surfaceDecision(decision, ctx, "Stop");
+		} catch (error) {
+			ctx.ui.notify(`claude-hooks Stop failed: ${(error as Error).message}`, "error");
+		}
+	});
+
+	pi.on("agent_settled", async (_event, ctx) => {
+		if (loadedHooks.disabled) return;
+		const defs = hooksFor("TeammateIdle");
+		if (defs.length === 0) return;
+		try {
+			const decision = await runClaudeHookSet(defs, "TeammateIdle", {}, ctx);
+			surfaceDecision(decision, ctx, "TeammateIdle");
+		} catch (error) {
+			ctx.ui.notify(`claude-hooks TeammateIdle failed: ${(error as Error).message}`, "error");
+		}
+	});
+
+	pi.on("session_compact", async (event, ctx) => {
+		if (loadedHooks.disabled) return;
+		const trigger = claudeCompactTrigger(event.reason);
+		const defs = hooksFor("PostCompact").filter((hook) =>
+			hookMatcherMatches(hook.matcher, [trigger]),
+		);
+		if (defs.length === 0) return;
+		try {
+			const decision = await runClaudeHookSet(
+				defs,
+				"PostCompact",
+				{ trigger, compact_summary: event.compactionEntry.summary },
+				ctx,
+			);
+			surfaceDecision(decision, ctx, "PostCompact");
+		} catch (error) {
+			ctx.ui.notify(`claude-hooks PostCompact failed: ${(error as Error).message}`, "error");
+		}
+	});
+
+	pi.on("session_shutdown", async (event, ctx) => {
+		if (loadedHooks.disabled) return;
+		const defs = hooksFor("SessionEnd");
+		if (defs.length === 0) return;
+		try {
+			const decision = await runClaudeHookSet(
+				defs,
+				"SessionEnd",
+				{ reason: claudeSessionEndReason(event.reason) },
+				ctx,
+			);
+			surfaceDecision(decision, ctx, "SessionEnd");
+		} catch (error) {
+			ctx.ui.notify(`claude-hooks SessionEnd failed: ${(error as Error).message}`, "error");
+		}
 	});
 
 	pi.registerTool({
@@ -488,6 +800,35 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 				content: [{ type: "text", text: result.text }],
 				details,
 			};
+		},
+	});
+
+	pi.registerCommand("claude-hooks", {
+		description: "Show or reload Claude settings.json hooks synced to pi events",
+		handler: async (args, ctx) => {
+			const trimmed = args.trim();
+			if (trimmed === "reload") {
+				loadedHooks = loadHookSettings(getHookSettingsFiles(ctx.cwd));
+				ctx.ui.setStatus(
+					"claude-hooks",
+					loadedHooks.disabled ? "off" : `${loadedHooks.hooks.length} hooks`,
+				);
+				ctx.ui.notify(describeHooks(loadedHooks), "info");
+				return;
+			}
+
+			const lines: string[] = [describeHooks(loadedHooks), ""];
+			for (const hook of loadedHooks.hooks) {
+				const matcher = hook.matcher === undefined ? "" : ` [${hook.matcher}]`;
+				const command = hook.spec.command ?? "";
+				const preview = command.length > 80 ? `${command.slice(0, 80)}...` : command;
+				lines.push(`- ${hook.event}${matcher} (${path.basename(hook.sourceFile)}): ${preview}`);
+			}
+			pi.sendMessage({
+				customType: "claude-hooks",
+			content: lines.join("\n"),
+			display: true,
+		});
 		},
 	});
 

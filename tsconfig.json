@@ -13,5 +13,5 @@
     "isolatedModules": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["index.ts", "index.test.ts"]
+  "include": ["index.ts", "index.test.ts", "hooks.ts", "hooks.test.ts"]
 }
