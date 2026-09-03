@@ -63,16 +63,24 @@ The extension registers `load_claude_rules`, which the agent can call with file 
 
 ## Commands
 
-- `/claude-rules` — show how many rules are loaded.
-- `/claude-rules reload` — reload files from disk.
-- `/claude-rules <path> [path...]` — show the rules matching one or more paths.
+- `/claude-rules` show how many rules are loaded.
+- `/claude-rules reload` reload rule files from disk.
+- `/claude-rules <path> [path...]` show the rules matching one or more paths.
+- `/claude-hooks` list every synced hook with its event, matcher, source file, and command.
+- `/claude-hooks reload` reload hooks from the settings files.
 
 ## Configuration
 
-Set `PI_CLAUDE_RULES_DIR` to use a different global rules directory:
+Environment variables, all optional:
+
+- `PI_CLAUDE_RULES_DIR` overrides the global rules directory (default `~/.claude/rules`).
+- `PI_CLAUDE_SETTINGS_FILE` overrides the global settings file for hooks (default `~/.claude/settings.json`).
+- `PI_CLAUDE_HOOKS_ENABLED=0` disables hook syncing entirely.
 
 ```bash
 PI_CLAUDE_RULES_DIR=~/my-rules pi -e ./index.ts
+PI_CLAUDE_SETTINGS_FILE=~/my-settings.json pi -e ./index.ts
+PI_CLAUDE_HOOKS_ENABLED=0 pi -e ./index.ts
 ```
 
 ## Glob support
@@ -124,13 +132,3 @@ Hook stdout and exit codes follow Claude's protocol:
 - `systemMessage` is shown as a warning.
 
 Limitations where pi has no equivalent: a `UserPromptSubmit` block cannot erase an already submitted prompt, and a `Stop` block cannot resume a finished run; both surface a warning instead. Timed-out hooks discard their output, matching Claude.
-
-### Commands
-
-- `/claude-hooks` list every synced hook with its event, matcher, source file, and command.
-- `/claude-hooks reload` reload hooks from the settings files.
-
-### Configuration
-
-- `PI_CLAUDE_SETTINGS_FILE` overrides the global settings file path (default `~/.claude/settings.json`).
-- `PI_CLAUDE_HOOKS_ENABLED=0` disables hook syncing entirely.

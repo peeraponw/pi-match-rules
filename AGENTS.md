@@ -3,10 +3,13 @@
 ## Project
 - **Language**: TypeScript pi extension
 - **Entry point**: `index.ts`
+- **Modules**: `index.ts` (rules loading, system prompt injection, hook event wiring), `hooks.ts` (Claude hook protocol bridge)
 
 ## Commands
 ```bash
-pi -e ./index.ts
+pi -e ./index.ts   # run pi with this extension loaded
+npm run check      # tsc --noEmit
+npm test           # node --test index.test.ts hooks.test.ts
 ```
 
 ## Notes
