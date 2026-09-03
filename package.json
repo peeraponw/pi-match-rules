@@ -1,6 +1,6 @@
 {
   "name": "pi-match-rules",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A pi extension that loads Markdown rules from global and project-local .claude/rules directories and injects the relevant rules into pi's system prompt.",
   "keywords": [
     "pi-package"
