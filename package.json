@@ -14,7 +14,8 @@
   "scripts": {
     "clean": "echo 'nothing to clean'",
     "build": "echo 'nothing to build — pi loads index.ts directly'",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "node --test index.test.ts"
   },
   "pi": {
     "extensions": [

@@ -87,14 +87,18 @@ function parseScalar(value: string): FrontmatterValue {
 	return stripQuotes(trimmed);
 }
 
-function parseMarkdownRule(content: string): { frontmatter: Frontmatter; body: string } {
+export function parseMarkdownRule(content: string): {
+	frontmatter: Frontmatter;
+	body: string;
+	hasFrontmatter: boolean;
+} {
 	if (!content.startsWith("---\n")) {
-		return { frontmatter: {}, body: content.trim() };
+		return { frontmatter: {}, body: content.trim(), hasFrontmatter: false };
 	}
 
 	const end = content.indexOf("\n---", 4);
 	if (end === -1) {
-		return { frontmatter: {}, body: content.trim() };
+		return { frontmatter: {}, body: content.trim(), hasFrontmatter: false };
 	}
 
 	const frontmatter: Frontmatter = {};
@@ -127,7 +131,7 @@ function parseMarkdownRule(content: string): { frontmatter: Frontmatter; body: s
 		}
 	}
 
-	return { frontmatter, body };
+	return { frontmatter, body, hasFrontmatter: true };
 }
 
 function getStringValues(value: FrontmatterValue | undefined): string[] {
@@ -245,12 +249,12 @@ function findMarkdownFiles(dir: string, basePath = ""): string[] {
 	return results.sort();
 }
 
-function loadRules(rulesDir: string, source: RuleSource): Rule[] {
+export function loadRules(rulesDir: string, source: RuleSource): Rule[] {
 	return findMarkdownFiles(rulesDir).map((relativePath) => {
 		const absolutePath = path.join(rulesDir, relativePath);
 		const content = fs.readFileSync(absolutePath, "utf8");
-		const { frontmatter, body } = parseMarkdownRule(content);
-		const alwaysApply = frontmatter.alwaysApply === true;
+		const { frontmatter, body, hasFrontmatter } = parseMarkdownRule(content);
+		const alwaysApply = !hasFrontmatter || frontmatter.alwaysApply === true;
 
 		return {
 			absolutePath,
@@ -307,7 +311,7 @@ function extractPathCandidates(prompt: string): string[] {
 	return [...candidates];
 }
 
-function matchingRules(rules: Rule[], candidates: string[]): Rule[] {
+export function matchingRules(rules: Rule[], candidates: string[]): Rule[] {
 	return rules.filter((rule) => {
 		if (rule.alwaysApply) return true;
 		if (rule.patterns.length === 0) return false;

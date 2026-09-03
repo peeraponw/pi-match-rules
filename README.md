@@ -45,7 +45,7 @@ globs:
 Use strict typing and pytest.
 ```
 
-Rules with `alwaysApply: true` are injected every turn. Conditional rules are injected when the user prompt mentions a path matching one of the frontmatter patterns.
+Rules with `alwaysApply: true` — or no frontmatter at all — are injected every turn. Conditional rules are injected when the user prompt mentions a path matching one of the frontmatter patterns. A rule that has frontmatter but no `alwaysApply` and no patterns is inactive.
 
 Rules are loaded from both:
 
