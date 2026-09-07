@@ -403,6 +403,106 @@ function truncateForTool(text: string): { text: string; truncated: boolean } {
 	return { text: output.join("\n") + suffix, truncated };
 }
 
+const AGENTS_CONTEXT_CANDIDATES = [
+	"AGENTS.override.md",
+	"AGENTS.md",
+	"AGENTS.MD",
+	"CLAUDE.md",
+	"CLAUDE.MD",
+];
+const SUBDIR_CONTEXT_TOOLS = new Set(["read", "write", "edit", "ls", "find", "grep"]);
+
+export function subdirAgentsEnabled(): boolean {
+	const raw = process.env.PI_SUBDIR_AGENTS_MD;
+	if (raw === undefined || raw === "") return true;
+	return !["0", "false", "no", "off"].includes(raw.trim().toLowerCase());
+}
+
+function firstContextFileInDir(dir: string): string | undefined {
+	for (const name of AGENTS_CONTEXT_CANDIDATES) {
+		const filePath = path.join(dir, name);
+		try {
+			if (fs.statSync(filePath).isFile()) return filePath;
+		} catch {
+			// Missing candidate, try the next name.
+		}
+	}
+	return undefined;
+}
+
+/** Resolve through symlinks where the path exists, keeping the leaf for new files. */
+function resolveForWalk(input: string, cwd: string): string {
+	const absolute = path.resolve(cwd, input.trim());
+	try {
+		return fs.realpathSync(absolute);
+	} catch {
+		try {
+			return path.join(fs.realpathSync(path.dirname(absolute)), path.basename(absolute));
+		} catch {
+			return absolute;
+		}
+	}
+}
+
+/**
+ * Context files pi itself does not load, namely the ones sitting in directories
+ * strictly below cwd on the way to target, ordered from cwd outward.
+ */
+export function findSubdirContextFiles(cwd: string, target: string): string[] {
+	const resolvedCwd = resolveForWalk(cwd, process.cwd());
+	const resolvedTarget = resolveForWalk(target, resolvedCwd);
+	const relative = path.relative(resolvedCwd, resolvedTarget);
+	if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) return [];
+
+	const segments = relative.split(path.sep);
+	let dirCount = segments.length;
+	try {
+		if (!fs.statSync(resolvedTarget).isDirectory()) dirCount -= 1;
+	} catch {
+		dirCount -= 1;
+	}
+
+	const files: string[] = [];
+	let current = resolvedCwd;
+	for (const segment of segments.slice(0, dirCount)) {
+		current = path.join(current, segment);
+		const file = firstContextFileInDir(current);
+		if (file !== undefined) files.push(file);
+	}
+	return files;
+}
+
+function formatSubdirContextFiles(entries: Array<{ path: string; body: string }>): string {
+	const sections = entries.map((entry) => `### ${entry.path}\n\n${entry.body}`);
+	return `## Subdirectory context files\n\npi does not load AGENTS.md from subdirectories at startup. These files govern the directories touched by the tool result above. Apply them as active instructions for files under their directory.\n\n${sections.join("\n\n---\n\n")}`;
+}
+
+export function buildSubdirContextAppendix(
+	toolName: string,
+	input: unknown,
+	cwd: string,
+	injected: Set<string>,
+): string {
+	if (!SUBDIR_CONTEXT_TOOLS.has(toolName)) return "";
+	if (input === null || typeof input !== "object" || !("path" in input)) return "";
+	const target = input.path;
+	if (typeof target !== "string" || target.trim() === "") return "";
+
+	const entries: Array<{ path: string; body: string }> = [];
+	for (const file of findSubdirContextFiles(cwd, target)) {
+		if (injected.has(file)) continue;
+		injected.add(file);
+		try {
+			const body = fs.readFileSync(file, "utf8").trim();
+			if (body !== "") entries.push({ path: file, body });
+		} catch (error) {
+			console.error(`pi-match-rules: failed to read ${file}: ${(error as Error).message}`);
+		}
+	}
+	if (entries.length === 0) return "";
+	return truncateForTool(formatSubdirContextFiles(entries)).text;
+}
+
 export default function claudeRuleMatcher(pi: ExtensionAPI) {
 	let loadedRules: LoadedRules = {
 		rules: [],
@@ -423,6 +523,8 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 	let sessionContextQueue: string[] = [];
 	// PreToolUse additionalContext, appended to the matching tool result.
 	const pendingToolContext = new Map<string, string>();
+	// Subdirectory AGENTS.md files already appended this session, keyed by absolute path.
+	const injectedSubdirContext = new Set<string>();
 
 	type HookBridgeContext = {
 		cwd: string;
@@ -433,6 +535,7 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 	function reloadRules(cwd: string): string {
 		loadedRules = loadMergedRules(cwd);
 		rules = loadedRules.rules;
+		injectedSubdirContext.clear();
 		return describeRules(loadedRules);
 	}
 
@@ -628,18 +731,22 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
-		if (loadedHooks.disabled) return;
 		const claudeEvent = event.isError ? "PostToolUseFailure" : "PostToolUse";
-		const defs = hooksFor(claudeEvent).filter((hook) =>
-			hookMatcherMatches(hook.matcher, toolNamesForHookMatcher(event.toolName)),
-		);
+		const defs = loadedHooks.disabled
+			? []
+			: hooksFor(claudeEvent).filter((hook) =>
+					hookMatcherMatches(hook.matcher, toolNamesForHookMatcher(event.toolName)),
+			);
 		const preToolContext = pendingToolContext.get(event.toolCallId);
 		pendingToolContext.delete(event.toolCallId);
-		if (defs.length === 0 && preToolContext === undefined) return;
+		const subdirContext = subdirAgentsEnabled()
+			? buildSubdirContextAppendix(event.toolName, event.input, ctx.cwd, injectedSubdirContext)
+			: "";
+		if (defs.length === 0 && preToolContext === undefined && subdirContext === "") return;
 
 		const input = event.input as Record<string, unknown>;
 		const content = event.content;
-		let appendix = preToolContext ?? "";
+		let hookAppendix = preToolContext ?? "";
 		let markError = false;
 		if (defs.length > 0) {
 			const extra: Record<string, unknown> = {
@@ -657,16 +764,24 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 				const decision = await runClaudeHookSet(defs, claudeEvent, extra, ctx);
 				surfaceDecision(decision, ctx, claudeEvent);
 				if (decision.resultAppendix !== undefined) {
-					appendix = appendix === "" ? decision.resultAppendix : `${appendix}\n\n${decision.resultAppendix}`;
+					hookAppendix =
+					hookAppendix === "" ? decision.resultAppendix : `${hookAppendix}\n\n${decision.resultAppendix}`;
 				}
 				markError = decision.markResultError;
 			} catch (error) {
 				ctx.ui.notify(`claude-hooks ${claudeEvent} failed: ${(error as Error).message}`, "error");
 			}
 		}
-		if (appendix === "") return;
+		const extraBlocks: Array<{ type: "text"; text: string }> = [];
+		if (subdirContext !== "") {
+			extraBlocks.push({ type: "text", text: `\n[Subdirectory AGENTS.md]\n${subdirContext}` });
+		}
+		if (hookAppendix !== "") {
+			extraBlocks.push({ type: "text", text: `\n[Claude hook feedback]\n${hookAppendix}` });
+		}
+		if (extraBlocks.length === 0) return;
 		return {
-			content: [...content, { type: "text", text: `\n[Claude hook feedback]\n${appendix}` }],
+			content: [...content, ...extraBlocks],
 			...(markError ? { isError: true } : {}),
 		};
 	});

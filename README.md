@@ -3,6 +3,7 @@
 A pi extension that syncs Claude Code configuration into pi:
 
 - Loads Markdown rules from global and project-local `.claude/rules` directories and injects the relevant rules into pi's system prompt.
+- Injects subdirectory `AGENTS.md` / `CLAUDE.md` files that pi itself never loads, because pi only reads context files from the working directory and its ancestors.
 - Runs Claude Code hooks from `~/.claude/settings.json` (and project-local `.claude/settings.json` / `.claude/settings.local.json`) on the matching pi events, so hooks like Orca telemetry or voice-lint work identically in both agents.
 
 ## Install
@@ -48,7 +49,7 @@ globs:
 Use strict typing and pytest.
 ```
 
-Rules with `alwaysApply: true` — or no frontmatter at all — are injected every turn. Conditional rules are injected when the user prompt mentions a path matching one of the frontmatter patterns. A rule that has frontmatter but no `alwaysApply` and no patterns is inactive.
+Rules with `alwaysApply: true` (or no frontmatter at all) are injected every turn. Conditional rules are injected when the user prompt mentions a path matching one of the frontmatter patterns. A rule that has frontmatter but no `alwaysApply` and no patterns is inactive.
 
 Rules are loaded from both:
 
@@ -60,6 +61,16 @@ If a global and local rule share the same relative path under their rules direct
 ## Tool
 
 The extension registers `load_claude_rules`, which the agent can call with file paths discovered during the task. It returns the matching rule contents plus `alwaysApply` rules by default. Tool output is truncated to 50KB or 2000 lines.
+
+## Subdirectory AGENTS.md
+
+pi loads `AGENTS.md` (or `CLAUDE.md`) only from the working directory and its ancestors, so context files in subdirectories never reach the session. This extension fills that gap. When a tool touches a path under a subdirectory that has its own context file, the file's content is appended to that tool's result, once per file per session.
+
+- Candidates per directory, in priority order, match pi's own list (`AGENTS.override.md`, then `AGENTS.md` / `AGENTS.MD`, then `CLAUDE.md` / `CLAUDE.MD`), and only the first present file in a directory is used.
+- Applies to `read`, `write`, `edit`, `ls`, `find`, and `grep` calls that carry a `path` input under the session cwd. `bash` commands are not inspected, since their working directories cannot be resolved reliably.
+- Paths outside the session cwd are ignored. The cwd's own context file is skipped because pi already loaded it at startup.
+- A chain of nested files is injected together, ordered from the directory closest to the cwd outward.
+- Appended output is truncated to 50KB or 2000 lines. `/claude-rules reload` clears the injected set, so edited files can inject again later in the session.
 
 ## Commands
 
@@ -76,11 +87,13 @@ Environment variables, all optional:
 - `PI_CLAUDE_RULES_DIR` overrides the global rules directory (default `~/.claude/rules`).
 - `PI_CLAUDE_SETTINGS_FILE` overrides the global settings file for hooks (default `~/.claude/settings.json`).
 - `PI_CLAUDE_HOOKS_ENABLED=0` disables hook syncing entirely.
+- `PI_SUBDIR_AGENTS_MD=0` disables subdirectory `AGENTS.md` injection.
 
 ```bash
 PI_CLAUDE_RULES_DIR=~/my-rules pi -e ./index.ts
 PI_CLAUDE_SETTINGS_FILE=~/my-settings.json pi -e ./index.ts
 PI_CLAUDE_HOOKS_ENABLED=0 pi -e ./index.ts
+PI_SUBDIR_AGENTS_MD=0 pi -e ./index.ts
 ```
 
 ## Glob support
