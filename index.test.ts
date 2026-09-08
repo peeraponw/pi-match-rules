@@ -85,6 +85,48 @@ test("matchingRules: conditional rule still loads only on matching path", () => 
 	}
 });
 
+test("loadRules: follows symlinked rule files and directories", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-"));
+	const target = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-target-"));
+	try {
+		fs.mkdirSync(path.join(target, "nested"));
+		fs.writeFileSync(path.join(target, "linked.md"), "---\nalwaysApply: true\n---\n\nlinked body");
+		fs.writeFileSync(path.join(target, "nested", "deep.md"), "# Deep");
+		fs.writeFileSync(path.join(dir, "plain.md"), "# Plain");
+		fs.symlinkSync(path.join(target, "linked.md"), path.join(dir, "linked.md"));
+		fs.symlinkSync(target, path.join(dir, "shared"));
+
+		const byName = Object.fromEntries(
+			loadRules(dir, "global").map((rule) => [rule.relativePath, rule]),
+		);
+
+		assert.ok(byName["linked.md"], "symlinked .md file is loaded");
+		assert.equal(byName["linked.md"]?.body, "linked body", "reads the target content");
+		assert.equal(byName["linked.md"]?.absolutePath, path.join(dir, "linked.md"));
+		assert.ok(byName["shared/linked.md"], "symlinked directory is traversed");
+		assert.ok(byName["shared/nested/deep.md"], "nested dirs under symlink are traversed");
+		assert.ok(byName["plain.md"], "regular files still load");
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+		fs.rmSync(target, { recursive: true, force: true });
+	}
+});
+
+test("loadRules: broken symlink and directory cycle do not hang or throw", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-"));
+	try {
+		fs.writeFileSync(path.join(dir, "plain.md"), "# Plain");
+		fs.symlinkSync(path.join(dir, "missing.md"), path.join(dir, "broken.md"));
+		fs.symlinkSync(dir, path.join(dir, "self"));
+
+		const names = loadRules(dir, "global").map((rule) => rule.relativePath);
+
+		assert.deepEqual(names, ["plain.md"], "broken link and cycle are skipped, plain loads");
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 function makeContextTree(): string {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agents-"));
 	fs.writeFileSync(path.join(root, "AGENTS.md"), "# root context\n");

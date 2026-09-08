@@ -254,17 +254,47 @@ function matchesPattern(pattern: string, candidate: string): boolean {
 	return false;
 }
 
-function findMarkdownFiles(dir: string, basePath = ""): string[] {
-	if (!fs.existsSync(dir)) return [];
+function symlinkTargetKind(absolutePath: string): "dir" | "file" | "other" | "broken" {
+	try {
+		const stats = fs.statSync(absolutePath); // statSync follows symlinks.
+		if (stats.isDirectory()) return "dir";
+		if (stats.isFile()) return "file";
+		return "other";
+	} catch {
+		return "broken";
+	}
+}
+
+function findMarkdownFiles(dir: string, basePath = "", visitedDirs = new Set<string>()): string[] {
+	let resolvedDir: string;
+	try {
+		resolvedDir = fs.realpathSync(dir);
+	} catch {
+		return [];
+	}
+	// A symlink may point at an ancestor directory (or one already walked via
+	// another link), so dedupe on the real path instead of recursing forever.
+	if (visitedDirs.has(resolvedDir)) return [];
+	visitedDirs.add(resolvedDir);
 
 	const results: string[] = [];
-	for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+	for (const entry of fs.readdirSync(resolvedDir, { withFileTypes: true })) {
 		const relativePath = basePath ? `${basePath}/${entry.name}` : entry.name;
 		const absolutePath = path.join(dir, entry.name);
 
-		if (entry.isDirectory()) {
-			results.push(...findMarkdownFiles(absolutePath, relativePath));
-		} else if (entry.isFile() && entry.name.endsWith(".md")) {
+		// readdirSync reports symlinks as neither file nor directory; stat the
+		// target so symlinked rule files and rule directories are discovered.
+		let isDirectory = entry.isDirectory();
+		let isFile = entry.isFile();
+		if (entry.isSymbolicLink()) {
+			const kind = symlinkTargetKind(absolutePath);
+			isDirectory = kind === "dir";
+			isFile = kind === "file";
+		}
+
+		if (isDirectory) {
+			results.push(...findMarkdownFiles(absolutePath, relativePath, visitedDirs));
+		} else if (isFile && entry.name.endsWith(".md")) {
 			results.push(relativePath);
 		}
 	}

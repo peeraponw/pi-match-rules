@@ -58,6 +58,8 @@ Rules are loaded from both:
 
 If a global and local rule share the same relative path under their rules directory, the local rule wins and the global one is not loaded. Only exact relative-path collisions override; `python/api.md`, `ts/api.md`, and `api.md` are all different rule names.
 
+Symlinked rule files and directories are followed, so a rules directory entry can be a symlink into another tree (for example `.claude/rules/shared` pointing at Claude's rules directory). The rule's identity stays the symlink path under the rules directory. Broken symlinks are skipped, and directory cycles are cut by tracking the real paths already visited.
+
 ## Tool
 
 The extension registers `load_claude_rules`, which the agent can call with file paths discovered during the task. It returns the matching rule contents plus `alwaysApply` rules by default. Tool output is truncated to 50KB or 2000 lines.
