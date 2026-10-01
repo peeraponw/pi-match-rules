@@ -5,9 +5,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	buildSubdirContextAppendix,
+	type RuleLocation,
 	default as claudeRuleMatcher,
 	findSubdirContextFiles,
 	matchingRules,
+	mergeRules,
 	parseMarkdownRule,
 	loadRules,
 	subdirAgentsEnabled,
@@ -82,6 +84,87 @@ test("matchingRules: conditional rule still loads only on matching path", () => 
 		assert.deepEqual(matched, ["cond.md", "plain.md"]);
 	} finally {
 		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("mergeRules: later locations override the same relative path across claude and agents dirs", () => {
+	const claudeGlobal = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-cg-"));
+	const agentsGlobal = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-ag-"));
+	const claudeLocal = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-cl-"));
+	const agentsLocal = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-al-"));
+	try {
+		fs.writeFileSync(path.join(claudeGlobal, "shared.md"), "---\nalwaysApply: true\n---\n\n\nclaude global");
+		fs.writeFileSync(path.join(claudeGlobal, "claude-only.md"), "# claude only");
+		fs.writeFileSync(path.join(agentsGlobal, "agents-only.md"), "# agents only");
+		fs.writeFileSync(path.join(claudeLocal, "shared.md"), "---\nalwaysApply: true\n---\n\n\nclaude local");
+		fs.writeFileSync(path.join(agentsLocal, "shared.md"), "---\nalwaysApply: true\n---\n\n\nagents local");
+
+		const loaded = mergeRules([
+			{ dir: claudeGlobal, source: "global" },
+			{ dir: agentsGlobal, source: "global" },
+			{ dir: claudeLocal, source: "local" },
+			{ dir: agentsLocal, source: "local" },
+		]);
+
+		const byName = Object.fromEntries(loaded.rules.map((rule) => [rule.relativePath, rule]));
+		assert.equal(loaded.rules.length, 3, "four dirs, two rules share one relative path");
+		assert.equal(byName["shared.md"]?.body, "agents local", "highest-precedence location wins");
+		assert.equal(byName["shared.md"]?.sourceDir, agentsLocal);
+		assert.ok(byName["claude-only.md"], "claude global rule loads");
+		assert.ok(byName["agents-only.md"], "agents global rule loads");
+		assert.deepEqual(loaded.overridden, ["shared.md"], "chained overrides are deduped");
+	} finally {
+		for (const dir of [claudeGlobal, agentsGlobal, claudeLocal, agentsLocal]) {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	}
+});
+
+test("mergeRules: the same real file reachable from two locations loads once", () => {
+	const claudeGlobal = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-cg-"));
+	const agentsGlobal = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-ag-"));
+	try {
+		fs.writeFileSync(path.join(claudeGlobal, "voice.md"), "# voice");
+		fs.symlinkSync(path.join(claudeGlobal, "voice.md"), path.join(agentsGlobal, "mirror.md"));
+
+		const loaded = mergeRules([
+			{ dir: claudeGlobal, source: "global" },
+			{ dir: agentsGlobal, source: "global" },
+		]);
+
+		assert.equal(loaded.rules.length, 1, "mirrored file is not injected twice");
+		assert.equal(loaded.rules[0]?.relativePath, "voice.md", "earlier location is kept");
+		assert.deepEqual(loaded.overridden, [], "a mirrored file is not an override");
+	} finally {
+		fs.rmSync(claudeGlobal, { recursive: true, force: true });
+		fs.rmSync(agentsGlobal, { recursive: true, force: true });
+	}
+});
+
+test("mergeRules: a whole rules directory symlinked as another location adds no duplicates", () => {
+	const claudeGlobal = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-cg-"));
+	const agentsHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-ah-"));
+	try {
+		fs.mkdirSync(path.join(claudeGlobal, "nested"));
+		fs.writeFileSync(path.join(claudeGlobal, "voice.md"), "# voice");
+		fs.writeFileSync(path.join(claudeGlobal, "nested", "deep.md"), "# deep");
+		// Simulates ~/.agents/rules -> ~/.claude/rules.
+		fs.symlinkSync(claudeGlobal, path.join(agentsHome, "rules"));
+
+		const loaded = mergeRules([
+			{ dir: claudeGlobal, source: "global" },
+			{ dir: path.join(agentsHome, "rules"), source: "global" },
+		]);
+
+		assert.deepEqual(
+			loaded.rules.map((rule) => rule.relativePath),
+		["nested/deep.md", "voice.md"],
+		"each rule appears exactly once",
+		);
+		assert.deepEqual(loaded.overridden, []);
+	} finally {
+		fs.rmSync(claudeGlobal, { recursive: true, force: true });
+		fs.rmSync(agentsHome, { recursive: true, force: true });
 	}
 });
 
@@ -255,6 +338,68 @@ test("subdirAgentsEnabled: PI_SUBDIR_AGENTS_MD=0 disables, default enables", () 
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBDIR_AGENTS_MD;
 		else process.env.PI_SUBDIR_AGENTS_MD = previous;
+	}
+});
+
+test("extension injects agents-dir rules alongside claude-dir rules", async () => {
+	const claudeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-claude-"));
+	const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-agents-"));
+	const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-project-"));
+	const handlers: Record<string, (event: unknown, ctx: unknown) => Promise<unknown>> = {};
+	const fake = {
+		on(name: string, handler: (event: never, ctx: never) => Promise<unknown>) {
+			handlers[name] = handler as (event: unknown, ctx: unknown) => Promise<unknown>;
+		},
+		registerTool: () => undefined,
+		registerCommand: () => undefined,
+		sendMessage: () => undefined,
+	};
+	const previousClaudeDir = process.env.PI_CLAUDE_RULES_DIR;
+	const previousAgentsDir = process.env.PI_AGENTS_RULES_DIR;
+	const previousHooksEnabled = process.env.PI_CLAUDE_HOOKS_ENABLED;
+	try {
+		process.env.PI_CLAUDE_RULES_DIR = claudeDir;
+		process.env.PI_AGENTS_RULES_DIR = agentsDir;
+		// Keep the machine's real settings.json hooks out of the test run.
+		process.env.PI_CLAUDE_HOOKS_ENABLED = "0";
+		fs.writeFileSync(
+			path.join(claudeDir, "claude.md"),
+			"---\nalwaysApply: true\n---\n\n\nclaude rule body",
+		);
+		fs.writeFileSync(
+			path.join(agentsDir, "agents.md"),
+			'---\npatterns:\n  - "**/*.rs"\n---\n\n\nagents rule body',
+		);
+
+		claudeRuleMatcher(fake as unknown as Parameters<typeof claudeRuleMatcher>[0]);
+		const ctx = {
+			cwd: project,
+			ui: { notify: () => undefined, setStatus: () => undefined },
+			sessionManager: { getSessionId: () => "test", getSessionFile: () => undefined },
+		};
+		await handlers["session_start"]?.({ reason: "new" }, ctx);
+		const result = (await handlers["before_agent_start"]?.(
+			{ prompt: "please edit src/main.rs", systemPrompt: "base" },
+			ctx,
+		)) as { systemPrompt?: string } | undefined;
+
+		assert.ok(result?.systemPrompt, "returns a patched system prompt");
+		assert.match(result.systemPrompt ?? "", /claude rule body/);
+		assert.match(result.systemPrompt ?? "", /agents rule body/, "agents dir rule is injected");
+		assert.ok(
+			(result.systemPrompt ?? "").includes(`### ${path.join(agentsDir, "agents.md")}`),
+			"agents rule is attributed to its own directory",
+		);
+	} finally {
+		if (previousClaudeDir === undefined) delete process.env.PI_CLAUDE_RULES_DIR;
+		else process.env.PI_CLAUDE_RULES_DIR = previousClaudeDir;
+		if (previousAgentsDir === undefined) delete process.env.PI_AGENTS_RULES_DIR;
+		else process.env.PI_AGENTS_RULES_DIR = previousAgentsDir;
+		if (previousHooksEnabled === undefined) delete process.env.PI_CLAUDE_HOOKS_ENABLED;
+		else process.env.PI_CLAUDE_HOOKS_ENABLED = previousHooksEnabled;
+		fs.rmSync(claudeDir, { recursive: true, force: true });
+		fs.rmSync(agentsDir, { recursive: true, force: true });
+		fs.rmSync(project, { recursive: true, force: true });
 	}
 });
 

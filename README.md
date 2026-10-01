@@ -2,7 +2,7 @@
 
 A pi extension that syncs Claude Code configuration into pi:
 
-- Loads Markdown rules from global and project-local `.claude/rules` directories and injects the relevant rules into pi's system prompt.
+- Loads Markdown rules from global and project-local `.claude/rules` and `.agents/rules` directories and injects the relevant rules into pi's system prompt.
 - Injects subdirectory `AGENTS.md` / `CLAUDE.md` files that pi itself never loads, because pi only reads context files from the working directory and its ancestors.
 - Runs Claude Code hooks from `~/.claude/settings.json` (and project-local `.claude/settings.json` / `.claude/settings.local.json`) on the matching pi events, so hooks like Orca telemetry or voice-lint work identically in both agents.
 
@@ -51,12 +51,14 @@ Use strict typing and pytest.
 
 Rules with `alwaysApply: true` (or no frontmatter at all) are injected every turn. Conditional rules are injected when the user prompt mentions a path matching one of the frontmatter patterns. A rule that has frontmatter but no `alwaysApply` and no patterns is inactive.
 
-Rules are loaded from both:
+Rules are loaded from four directories, in increasing precedence:
 
 - Global: `~/.claude/rules/**/*.md` by default
+- Global: `~/.agents/rules/**/*.md` by default
 - Local: `<project>/.claude/rules/**/*.md`
+- Local: `<project>/.agents/rules/**/*.md`
 
-If a global and local rule share the same relative path under their rules directory, the local rule wins and the global one is not loaded. Only exact relative-path collisions override; `python/api.md`, `ts/api.md`, and `api.md` are all different rule names.
+If two directories hold a rule with the same relative path, the directory later in that list wins and the earlier rule is not loaded. Only exact relative-path collisions override; `python/api.md`, `ts/api.md`, and `api.md` are all different rule names. A file reachable from two locations, for example when `~/.agents/rules` is a symlink to `~/.claude/rules`, is loaded once.
 
 Symlinked rule files and directories are followed, so a rules directory entry can be a symlink into another tree (for example `.claude/rules/shared` pointing at Claude's rules directory). The rule's identity stays the symlink path under the rules directory. Broken symlinks are skipped, and directory cycles are cut by tracking the real paths already visited.
 
@@ -86,13 +88,15 @@ pi loads `AGENTS.md` (or `CLAUDE.md`) only from the working directory and its an
 
 Environment variables, all optional:
 
-- `PI_CLAUDE_RULES_DIR` overrides the global rules directory (default `~/.claude/rules`).
+- `PI_CLAUDE_RULES_DIR` overrides the global Claude rules directory (default `~/.claude/rules`).
+- `PI_AGENTS_RULES_DIR` overrides the global agents rules directory (default `~/.agents/rules`).
 - `PI_CLAUDE_SETTINGS_FILE` overrides the global settings file for hooks (default `~/.claude/settings.json`).
 - `PI_CLAUDE_HOOKS_ENABLED=0` disables hook syncing entirely.
 - `PI_SUBDIR_AGENTS_MD=0` disables subdirectory `AGENTS.md` injection.
 
 ```bash
 PI_CLAUDE_RULES_DIR=~/my-rules pi -e ./index.ts
+PI_AGENTS_RULES_DIR=~/my-agents-rules pi -e ./index.ts
 PI_CLAUDE_SETTINGS_FILE=~/my-settings.json pi -e ./index.ts
 PI_CLAUDE_HOOKS_ENABLED=0 pi -e ./index.ts
 PI_SUBDIR_AGENTS_MD=0 pi -e ./index.ts

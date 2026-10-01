@@ -42,10 +42,14 @@ type Rule = {
 	body: string;
 };
 
+export type RuleLocation = {
+	dir: string;
+	source: RuleSource;
+};
+
 type LoadedRules = {
 	rules: Rule[];
-	globalDir: string;
-	localDir: string;
+	locations: RuleLocation[];
 	overridden: string[];
 };
 
@@ -63,7 +67,8 @@ type LoadClaudeRulesDetails = {
 	rules: RuleDetail[];
 };
 
-const DEFAULT_GLOBAL_RULES_DIR = "~/.claude/rules";
+const DEFAULT_GLOBAL_CLAUDE_RULES_DIR = "~/.claude/rules";
+const DEFAULT_GLOBAL_AGENTS_RULES_DIR = "~/.agents/rules";
 const PATTERN_KEYS = ["pattern", "patterns", "path", "paths", "glob", "globs"];
 const MAX_TOOL_BYTES = 50 * 1024;
 const MAX_TOOL_LINES = 2000;
@@ -322,34 +327,72 @@ export function loadRules(rulesDir: string, source: RuleSource): Rule[] {
 	});
 }
 
-function getGlobalRulesDir(): string {
-	return expandHome(process.env.PI_CLAUDE_RULES_DIR ?? DEFAULT_GLOBAL_RULES_DIR);
+function getGlobalClaudeRulesDir(): string {
+	return expandHome(process.env.PI_CLAUDE_RULES_DIR ?? DEFAULT_GLOBAL_CLAUDE_RULES_DIR);
 }
 
-function getLocalRulesDir(cwd: string): string {
+function getGlobalAgentsRulesDir(): string {
+	return expandHome(process.env.PI_AGENTS_RULES_DIR ?? DEFAULT_GLOBAL_AGENTS_RULES_DIR);
+}
+
+function getLocalClaudeRulesDir(cwd: string): string {
 	return path.join(cwd, ".claude", "rules");
 }
 
-function loadMergedRules(cwd: string): LoadedRules {
-	const globalDir = getGlobalRulesDir();
-	const localDir = getLocalRulesDir(cwd);
-	const byName = new Map<string, Rule>();
-	const overridden: string[] = [];
+function getLocalAgentsRulesDir(cwd: string): string {
+	return path.join(cwd, ".agents", "rules");
+}
 
-	for (const rule of loadRules(globalDir, "global")) {
-		byName.set(rule.relativePath, rule);
+/**
+ * Rule directories in precedence order, lowest first. A rule in a later
+ * directory replaces a rule with the same relative path from an earlier one.
+ */
+function getRuleLocations(cwd: string): RuleLocation[] {
+	return [
+		{ dir: getGlobalClaudeRulesDir(), source: "global" },
+		{ dir: getGlobalAgentsRulesDir(), source: "global" },
+		{ dir: getLocalClaudeRulesDir(cwd), source: "local" },
+		{ dir: getLocalAgentsRulesDir(cwd), source: "local" },
+	];
+}
+
+/** The file behind a rule, following symlinks so mirrored copies collapse. */
+function ruleFileIdentity(absolutePath: string): string {
+	try {
+		return fs.realpathSync(absolutePath);
+	} catch {
+		return absolutePath;
 	}
+}
 
-	for (const rule of loadRules(localDir, "local")) {
-		if (byName.has(rule.relativePath)) overridden.push(rule.relativePath);
-		byName.set(rule.relativePath, rule);
+export function mergeRules(locations: RuleLocation[]): LoadedRules {
+	const byName = new Map<string, Rule>();
+	const overridden = new Set<string>();
+	const seenFiles = new Set<string>();
+
+	for (const location of locations) {
+		for (const rule of loadRules(location.dir, location.source)) {
+			// The same real file can be reachable from two locations, for example
+			// when ~/.agents/rules is a symlink into ~/.claude/rules. Loading it
+			// once keeps the prompt free of duplicated rule text.
+			const identity = ruleFileIdentity(rule.absolutePath);
+			if (seenFiles.has(identity)) continue;
+			seenFiles.add(identity);
+
+			if (byName.has(rule.relativePath)) overridden.add(rule.relativePath);
+			byName.set(rule.relativePath, rule);
+		}
 	}
 
 	const rules = [...byName.values()].sort((a, b) =>
 		a.relativePath.localeCompare(b.relativePath) || a.source.localeCompare(b.source),
 	);
 
-	return { rules, globalDir, localDir, overridden: overridden.sort() };
+	return { rules, locations, overridden: [...overridden].sort((a, b) => a.localeCompare(b)) };
+}
+
+function loadMergedRules(cwd: string): LoadedRules {
+	return mergeRules(getRuleLocations(cwd));
 }
 
 function extractPathCandidates(prompt: string): string[] {
@@ -397,6 +440,19 @@ function formatRuleIndex(rules: Rule[]): string {
 	return `\n\n## Conditional Claude Rules Index\n\nAdditional rules are available. If you later work with a file matching one of these patterns, read the matching rule file before making changes.\n\n${rows.join("\n")}`;
 }
 
+function directoryExists(dir: string): boolean {
+	try {
+		return fs.statSync(dir).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+function formatDirList(dirs: string[]): string {
+	if (dirs.length <= 1) return dirs[0] ?? "";
+	return `${dirs.slice(0, -1).join(", ")} and ${dirs.at(-1)}`;
+}
+
 function describeRules(loaded: LoadedRules): string {
 	const always = loaded.rules.filter((rule) => rule.alwaysApply).length;
 	const conditional = loaded.rules.filter(
@@ -404,9 +460,17 @@ function describeRules(loaded: LoadedRules): string {
 	).length;
 	const inactive = loaded.rules.length - always - conditional;
 	const overrides = loaded.overridden.length > 0
-		? `, ${loaded.overridden.length} local override(s)`
+		? `, ${loaded.overridden.length} override(s)`
 		: "";
-	return `Claude rules: ${loaded.rules.length} loaded from ${loaded.globalDir} and ${loaded.localDir} (${always} always, ${conditional} conditional, ${inactive} without patterns${overrides})`;
+	// Only mention directories that exist, so machines without ~/.agents/rules
+	// see the same summary as before.
+	const dirs = formatDirList(
+		loaded.locations
+			.map((location) => location.dir)
+			.filter((dir) => directoryExists(dir)),
+	);
+	const from = dirs === "" ? "" : ` from ${dirs}`;
+	return `Claude rules: ${loaded.rules.length} loaded${from} (${always} always, ${conditional} conditional, ${inactive} without patterns${overrides})`;
 }
 
 function truncateForTool(text: string): { text: string; truncated: boolean } {
@@ -536,8 +600,7 @@ export function buildSubdirContextAppendix(
 export default function claudeRuleMatcher(pi: ExtensionAPI) {
 	let loadedRules: LoadedRules = {
 		rules: [],
-		globalDir: getGlobalRulesDir(),
-		localDir: getLocalRulesDir(process.cwd()),
+		locations: getRuleLocations(process.cwd()),
 		overridden: [],
 	};
 	let rules: Rule[] = [];
@@ -886,8 +949,8 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 		name: "load_claude_rules",
 		label: "Load Claude Rules",
 		description:
-			"Load Markdown rules from global and local .claude/rules directories matching one or more file paths. Output is truncated to 50KB or 2000 lines.",
-		promptSnippet: "Load global/local .claude/rules content matching file paths",
+			"Load Markdown rules from global and local .claude/rules and .agents/rules directories matching one or more file paths. Output is truncated to 50KB or 2000 lines.",
+		promptSnippet: "Load global/local .claude/rules and .agents/rules content matching file paths",
 		promptGuidelines: [
 			"Use load_claude_rules before editing or creating files when their paths may match conditional Claude rules.",
 		],
@@ -978,7 +1041,7 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("claude-rules", {
-		description: "Show or reload global/local .claude/rules frontmatter-driven rules",
+		description: "Show or reload global/local .claude/rules and .agents/rules frontmatter-driven rules",
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
 			if (trimmed === "reload") {
