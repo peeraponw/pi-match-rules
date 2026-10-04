@@ -5,13 +5,14 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	buildSubdirContextAppendix,
-	type RuleLocation,
 	default as claudeRuleMatcher,
+	deferredMatches,
 	findSubdirContextFiles,
 	matchingRules,
 	mergeRules,
 	parseMarkdownRule,
 	loadRules,
+	ruleMatchesName,
 	subdirAgentsEnabled,
 } from "./index.ts";
 
@@ -29,29 +30,101 @@ test("parseMarkdownRule: frontmatter block sets hasFrontmatter true", () => {
 	assert.equal(result.frontmatter.alwaysApply, true);
 });
 
-test("loadRules: no-frontmatter file is treated as alwaysApply", () => {
+test("loadRules: classification table across frontmatter states", () => {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-"));
 	try {
-		fs.writeFileSync(path.join(dir, "plain.md"), "# Plain\n\nNo frontmatter.");
-		fs.writeFileSync(path.join(dir, "always.md"), "---\nalwaysApply: true\n---\n\nalways");
-		fs.writeFileSync(path.join(dir, "cond.md"), '---\npatterns:\n  - "**/*.py"\n---\n\ncond');
-		fs.writeFileSync(path.join(dir, "false.md"), "---\nalwaysApply: false\n---\n\nexplicit false");
+		const cases: Array<[name: string, content: string, kind: string]> = [
+			["patterns-only.md", '---\npatterns:\n  - "**/*.py"\n---\n\nbody', "conditional"],
+			[
+				"patterns-desc.md",
+				'---\npatterns:\n  - "**/*.py"\ndescription_to_model:\n  - "Python standards"\n---\n\nbody',
+				"deferred",
+			],
+			["desc-only.md", '---\ndescription_to_model:\n  - "Topic guidance"\n---\n\nbody', "topic"],
+			["unrelated-key.md", "---\ntitle: hello\n---\n\nbody", "always"],
+			[
+				"always-true-desc.md",
+				'---\nalwaysApply: true\ndescription_to_model:\n  - "override"\n---\n\nbody',
+				"always",
+			],
+			["always-false.md", "---\nalwaysApply: false\n---\n\nbody", "disabled"],
+			[
+				"always-false-patterns.md",
+				'---\nalwaysApply: false\npatterns:\n  - "**/*.py"\n---\n\nbody',
+				"conditional",
+			],
+			["plain.md", "# no frontmatter", "always"],
+		];
+		for (const [name, content] of cases) fs.writeFileSync(path.join(dir, name), content);
 
-		const byName = Object.fromEntries(
-			loadRules(dir, "global").map((rule) => [rule.relativePath, rule]),
-		);
+		const all = loadRules(dir, "global");
+		const byName = Object.fromEntries(all.map((rule) => [rule.relativePath, rule]));
+		for (const [name, , kind] of cases) {
+			assert.equal(byName[name]?.kind, kind, `${name} should classify as ${kind}`);
+		}
+		assert.deepEqual(byName["patterns-desc.md"]?.descriptionToModel, ["Python standards"]);
+		assert.deepEqual(byName["desc-only.md"]?.descriptionToModel, ["Topic guidance"]);
+		assert.deepEqual(byName["plain.md"]?.descriptionToModel, []);
 
-		assert.equal(byName["plain.md"]?.alwaysApply, true, "no frontmatter => always");
-		assert.equal(byName["always.md"]?.alwaysApply, true);
-		assert.equal(byName["cond.md"]?.alwaysApply, false);
-		assert.equal(
-			byName["false.md"]?.alwaysApply,
-			false,
-			"explicit alwaysApply:false must NOT be always",
+		// Frontmatter with neither gate nor description is no longer inert.
+		const noCandidates = matchingRules(all, []).map((rule) => rule.relativePath).sort();
+		assert.deepEqual(noCandidates, ["always-true-desc.md", "plain.md", "unrelated-key.md"]);
+
+		// Deferred rules never auto-inject their bodies, even on pattern match.
+		const pyMatch = matchingRules(all, ["src/app/main.py"])
+			.map((rule) => rule.relativePath)
+			.sort();
+		assert.deepEqual(pyMatch, [
+			"always-false-patterns.md",
+			"always-true-desc.md",
+			"patterns-only.md",
+			"plain.md",
+			"unrelated-key.md",
+		]);
+		assert.deepEqual(
+			deferredMatches(all, ["src/app/main.py"]).map((rule) => rule.relativePath),
+			["patterns-desc.md"],
 		);
+		assert.deepEqual(deferredMatches(all, ["src/app/main.rs"]), []);
 	} finally {
 		fs.rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+test("parseMarkdownRule: description_to_model accepts list, inline array, and scalar forms", () => {
+	const list = parseMarkdownRule('---\ndescription_to_model:\n  - "a"\n  - "b"\n---\n\nbody');
+	assert.deepEqual(list.frontmatter.description_to_model, ["a", "b"]);
+	const inline = parseMarkdownRule('---\ndescription_to_model: ["a", "b"]\n---\n\nbody');
+	assert.deepEqual(inline.frontmatter.description_to_model, ["a", "b"]);
+	const scalar = parseMarkdownRule("---\ndescription_to_model: one line\n---\n\nbody");
+	assert.equal(scalar.frontmatter.description_to_model, "one line");
+});
+
+function makeRule(relativePath: string): Parameters<typeof ruleMatchesName>[0] {
+	return {
+		absolutePath: `/rules/${relativePath}`,
+		relativePath,
+		source: "global",
+		sourceDir: "/rules",
+		frontmatter: {},
+		patterns: [],
+		descriptionToModel: [],
+		kind: "topic",
+		body: "",
+	};
+}
+
+test("ruleMatchesName: matches relative path, basename, and stem", () => {
+	const rule = makeRule("shared/security.md");
+	assert.equal(ruleMatchesName(rule, "shared/security.md"), true, "exact relative path");
+	assert.equal(ruleMatchesName(rule, "security.md"), true, "basename");
+	assert.equal(ruleMatchesName(rule, "security"), true, "stem");
+	assert.equal(ruleMatchesName(rule, "shared/security"), true, "directory plus stem");
+	assert.equal(ruleMatchesName(rule, "api/security.md"), true, "basename matches across directories");
+	assert.equal(ruleMatchesName(rule, "shared/other.md"), false);
+	assert.equal(ruleMatchesName(rule, "other"), false);
+	assert.equal(ruleMatchesName(rule, "security.ts"), false, "foreign extension is not the rule");
+	assert.equal(ruleMatchesName(rule, " "), false, "blank name never matches");
 });
 
 test("matchingRules: no-frontmatter and always rules load even with no path candidates", () => {
@@ -452,5 +525,111 @@ test("extension appends subdirectory AGENTS.md to tool results once per file", a
 		assert.equal(second, undefined, "already injected this session");
 	} finally {
 		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("extension: model-decision rules defer bodies and load on demand", async () => {
+	const claudeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-claude-"));
+	const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-agents-"));
+	const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-project-"));
+	const handlers: Record<string, (event: unknown, ctx: unknown) => Promise<unknown>> = {};
+	type LoadTool = {
+		name: string;
+		execute: (toolCallId: string, params: unknown) => Promise<unknown>;
+	};
+	const tools: LoadTool[] = [];
+	const fake = {
+		on(name: string, handler: (event: never, ctx: never) => Promise<unknown>) {
+			handlers[name] = handler as (event: unknown, ctx: unknown) => Promise<unknown>;
+		},
+		registerTool(tool: LoadTool) {
+			tools.push(tool);
+		},
+		registerCommand: () => undefined,
+		sendMessage: () => undefined,
+	};
+	const previousClaudeDir = process.env.PI_CLAUDE_RULES_DIR;
+	const previousAgentsDir = process.env.PI_AGENTS_RULES_DIR;
+	const previousHooksEnabled = process.env.PI_CLAUDE_HOOKS_ENABLED;
+	try {
+		process.env.PI_CLAUDE_RULES_DIR = claudeDir;
+		process.env.PI_AGENTS_RULES_DIR = agentsDir;
+		process.env.PI_CLAUDE_HOOKS_ENABLED = "0";
+		fs.writeFileSync(
+			path.join(claudeDir, "topic.md"),
+			'---\ndescription_to_model:\n  - "Guards commit message formatting"\n---\n\nTOPIC BODY',
+		);
+		fs.writeFileSync(
+			path.join(claudeDir, "py-deferred.md"),
+			'---\npatterns:\n  - "**/*.py"\ndescription_to_model:\n  - "Python coding standards"\n---\n\nDEFERRED BODY',
+		);
+		fs.writeFileSync(
+			path.join(claudeDir, "rs-eager.md"),
+			'---\npatterns:\n  - "**/*.rs"\n---\n\nEAGER BODY',
+		);
+
+		claudeRuleMatcher(fake as unknown as Parameters<typeof claudeRuleMatcher>[0]);
+		const loadTool = tools.find((tool) => tool.name === "load_claude_rules");
+		assert.ok(loadTool, "extension registers load_claude_rules");
+		const ctx = {
+			cwd: project,
+			ui: { notify: () => undefined, setStatus: () => undefined },
+			sessionManager: { getSessionId: () => "test", getSessionFile: () => undefined },
+		};
+		await handlers["session_start"]?.({ reason: "new" }, ctx);
+
+		const runPrompt = async (prompt: string): Promise<string> => {
+			const result = (await handlers["before_agent_start"]?.(
+				{ prompt, systemPrompt: "base" },
+			ctx,
+			)) as { systemPrompt?: string } | undefined;
+			return result?.systemPrompt ?? "";
+		};
+		const runTool = async (params: unknown): Promise<string> => {
+			const result = (await loadTool?.execute("call", params)) as {
+				content?: Array<{ type: string; text?: string }>;
+			} | undefined;
+			return result?.content?.[0]?.text ?? "";
+		};
+
+		// A fileless prompt still sees the index, with descriptions only.
+		const fileless = await runPrompt("hello there");
+		assert.ok(fileless !== "", "fileless prompt patches the system prompt");
+		assert.match(fileless, /Claude Rules Index/);
+		assert.match(fileless, /Guards commit message formatting/, "topic rule is listed");
+		assert.match(fileless, /Python coding standards/, "pattern rule lists its description");
+		assert.ok(!fileless.includes("TOPIC BODY"), "topic body stays out");
+		assert.ok(!fileless.includes("DEFERRED BODY"), "deferred body stays out");
+		assert.ok(!fileless.includes("EAGER BODY"), "unmatched eager rule stays out");
+
+		// A path match surfaces the deferred description, never the body.
+		const pyPrompt = await runPrompt("please edit src/main.py now");
+		assert.match(pyPrompt, /Deferred Claude Rules/);
+		assert.match(pyPrompt, /Python coding standards/);
+		assert.ok(!pyPrompt.includes("DEFERRED BODY"), "deferred body is not auto-injected");
+		assert.ok(!pyPrompt.includes("EAGER BODY"), "unmatched pattern rule stays out");
+
+		// Pattern-only rules keep eager body injection.
+		const rsPrompt = await runPrompt("refactor src/lib.rs please");
+		assert.match(rsPrompt, /EAGER BODY/);
+		assert.ok(!rsPrompt.includes("DEFERRED BODY"));
+
+		// The tool returns full bodies, by name and by path.
+		assert.match(await runTool({ rules: ["py-deferred"] }), /DEFERRED BODY/);
+		assert.match(await runTool({ rules: ["topic"] }), /TOPIC BODY/);
+		const byPath = await runTool({ paths: ["src/main.py"] });
+		assert.match(byPath, /DEFERRED BODY/, "explicit path request returns the full body");
+		assert.ok(!byPath.includes("TOPIC BODY"), "paths do not pull topic bodies in");
+		assert.match(await runTool({ rules: ["nope"] }), /No Claude rules matched/);
+	} finally {
+		if (previousClaudeDir === undefined) delete process.env.PI_CLAUDE_RULES_DIR;
+		else process.env.PI_CLAUDE_RULES_DIR = previousClaudeDir;
+		if (previousAgentsDir === undefined) delete process.env.PI_AGENTS_RULES_DIR;
+		else process.env.PI_AGENTS_RULES_DIR = previousAgentsDir;
+		if (previousHooksEnabled === undefined) delete process.env.PI_CLAUDE_HOOKS_ENABLED;
+		else process.env.PI_CLAUDE_HOOKS_ENABLED = previousHooksEnabled;
+		fs.rmSync(claudeDir, { recursive: true, force: true });
+		fs.rmSync(agentsDir, { recursive: true, force: true });
+		fs.rmSync(project, { recursive: true, force: true });
 	}
 });

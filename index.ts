@@ -31,6 +31,13 @@ type Frontmatter = Record<string, FrontmatterValue>;
 
 type RuleSource = "global" | "local";
 
+/**
+ * How a rule is gated and delivered. Gate and delivery are separate axes:
+ * patterns decide when a rule becomes visible, description_to_model decides
+ * whether the model sees the body eagerly or loads it on demand.
+ */
+type RuleKind = "always" | "conditional" | "deferred" | "topic" | "disabled";
+
 type Rule = {
 	absolutePath: string;
 	relativePath: string;
@@ -38,7 +45,8 @@ type Rule = {
 	sourceDir: string;
 	frontmatter: Frontmatter;
 	patterns: string[];
-	alwaysApply: boolean;
+	descriptionToModel: string[];
+	kind: RuleKind;
 	body: string;
 };
 
@@ -58,7 +66,7 @@ type RuleDetail = {
 	source: RuleSource;
 	sourceDir: string;
 	patterns: string[];
-	alwaysApply: boolean;
+	kind: RuleKind;
 };
 
 type LoadClaudeRulesDetails = {
@@ -307,12 +315,45 @@ function findMarkdownFiles(dir: string, basePath = "", visitedDirs = new Set<str
 	return results.sort();
 }
 
+/**
+ * Classification, computed once at load time:
+ *
+ * - no frontmatter, or explicit `alwaysApply: true` -> `always` (body injected
+ *   every turn, the explicit flag overriding every other key)
+ * - patterns without `description_to_model` -> `conditional` (body injected on
+ *   pattern match)
+ * - patterns plus `description_to_model` -> `deferred` (description on pattern
+ *   match, body loaded through the tool)
+ * - `description_to_model` without patterns -> `topic` (description always
+ *   visible, body loaded through the tool)
+ * - `alwaysApply: false` without patterns -> `disabled`
+ * - frontmatter with neither gate nor description -> `always` (an explicit
+ *   `alwaysApply: false` is the only opt-out)
+ */
+function classifyRule(
+	hasFrontmatter: boolean,
+	frontmatter: Frontmatter,
+	patterns: string[],
+	descriptionToModel: string[],
+): RuleKind {
+	if (!hasFrontmatter) return "always";
+	if (frontmatter.alwaysApply === true) return "always";
+	if (patterns.length > 0) {
+		return descriptionToModel.length > 0 ? "deferred" : "conditional";
+	}
+	if (frontmatter.alwaysApply === false) return "disabled";
+	return descriptionToModel.length > 0 ? "topic" : "always";
+}
+
 export function loadRules(rulesDir: string, source: RuleSource): Rule[] {
 	return findMarkdownFiles(rulesDir).map((relativePath) => {
 		const absolutePath = path.join(rulesDir, relativePath);
 		const content = fs.readFileSync(absolutePath, "utf8");
 		const { frontmatter, body, hasFrontmatter } = parseMarkdownRule(content);
-		const alwaysApply = !hasFrontmatter || frontmatter.alwaysApply === true;
+		const patterns = frontmatterPatterns(frontmatter);
+		const descriptionToModel = getStringValues(frontmatter["description_to_model"])
+			.map((value) => value.trim())
+			.filter(Boolean);
 
 		return {
 			absolutePath,
@@ -320,8 +361,9 @@ export function loadRules(rulesDir: string, source: RuleSource): Rule[] {
 			source,
 			sourceDir: rulesDir,
 			frontmatter,
-			patterns: frontmatterPatterns(frontmatter),
-			alwaysApply,
+			patterns,
+			descriptionToModel,
+			kind: classifyRule(hasFrontmatter, frontmatter, patterns, descriptionToModel),
 			body,
 		};
 	});
@@ -407,37 +449,115 @@ function extractPathCandidates(prompt: string): string[] {
 	return [...candidates];
 }
 
+function ruleMatchesCandidates(rule: Rule, candidates: string[]): boolean {
+	return candidates.some((candidate) =>
+		rule.patterns.some((pattern) => matchesPattern(pattern, candidate)),
+	);
+}
+
+/** Rules whose bodies are auto-injected for the given path candidates. */
 export function matchingRules(rules: Rule[], candidates: string[]): Rule[] {
 	return rules.filter((rule) => {
-		if (rule.alwaysApply) return true;
-		if (rule.patterns.length === 0) return false;
-		return candidates.some((candidate) =>
-			rule.patterns.some((pattern) => matchesPattern(pattern, candidate)),
-		);
+		if (rule.kind === "always") return true;
+		if (rule.kind === "conditional") return ruleMatchesCandidates(rule, candidates);
+		return false;
 	});
+}
+
+/** Pattern-gated lazy rules whose descriptions surface for these candidates. */
+export function deferredMatches(rules: Rule[], candidates: string[]): Rule[] {
+	return rules.filter(
+		(rule) => rule.kind === "deferred" && ruleMatchesCandidates(rule, candidates),
+	);
+}
+
+/**
+ * Name selection for explicit loads: relative path (`shared/security.md`),
+ * basename (`security.md`), or stem (`security`). Gate does not apply, the
+ * caller asked for the rule by name. Disabled rules stay disabled.
+ */
+export function ruleMatchesName(rule: Rule, name: string): boolean {
+	const normalized = normalizePathForMatch(name);
+	if (normalized === "") return false;
+	if (normalizePathForMatch(rule.relativePath) === normalized) return true;
+	const nameBase = path.posix.basename(normalized);
+	const ruleBase = path.posix.basename(rule.relativePath);
+	if (nameBase === ruleBase) return true;
+	const stem = (value: string) => value.replace(/\.md$/i, "");
+	return stem(nameBase) === stem(ruleBase);
+}
+
+function ruleHeaderInfo(rule: Rule): string {
+	if (rule.kind === "always") return "alwaysApply: true";
+	if (rule.kind === "topic") {
+		return `description_to_model: ${rule.descriptionToModel.join(" ")}`;
+	}
+	if (rule.kind === "deferred") {
+		return `patterns: ${rule.patterns.join(", ")}\ndescription_to_model: ${rule.descriptionToModel.join(" ")}`;
+	}
+	return `patterns: ${rule.patterns.join(", ")}`;
 }
 
 function formatRulesForPrompt(rules: Rule[], reason: string): string {
 	const sections = rules.map((rule) => {
 		const header = `### ${rule.absolutePath}`;
-		const matchInfo = rule.alwaysApply
-			? "alwaysApply: true"
-			: `patterns: ${rule.patterns.join(", ")}`;
-		return `${header}\nsource: ${rule.source}\n${matchInfo}\n\n${rule.body}`;
+		return `${header}\nsource: ${rule.source}\n${ruleHeaderInfo(rule)}\n\n${rule.body}`;
 	});
 
 	return `## Claude Rules\n\nLoaded rules (${reason}). Apply these rules as active instructions.\n\n${sections.join("\n\n---\n\n")}`;
 }
 
+const MAX_DESCRIPTION_LENGTH = 160;
+
+/** One line of description text, whitespace-normalized and length-capped. */
+function ruleDescription(rule: Rule): string {
+	const normalized = rule.descriptionToModel.join(" ").replace(/\s+/g, " ").trim();
+	if (normalized.length <= MAX_DESCRIPTION_LENGTH) return normalized;
+	return `${normalized.slice(0, MAX_DESCRIPTION_LENGTH - 1).trimEnd()}…`;
+}
+
 function formatRuleIndex(rules: Rule[]): string {
-	const conditional = rules.filter((rule) => !rule.alwaysApply && rule.patterns.length > 0);
-	if (conditional.length === 0) return "";
-
-	const rows = conditional.map(
-		(rule) => `- ${rule.absolutePath} (${rule.source}) — ${rule.patterns.join(", ")}`,
+	const patternRules = rules.filter(
+		(rule) => rule.kind === "conditional" || rule.kind === "deferred",
 	);
+	const topicRules = rules.filter((rule) => rule.kind === "topic");
+	if (patternRules.length === 0 && topicRules.length === 0) return "";
 
-	return `\n\n## Conditional Claude Rules Index\n\nAdditional rules are available. If you later work with a file matching one of these patterns, read the matching rule file before making changes.\n\n${rows.join("\n")}`;
+	const lines: string[] = [
+		"## Claude Rules Index",
+		"",
+		"Additional rules are available on demand. Load them with the load_claude_rules tool before making changes they govern.",
+		"",
+	];
+
+	if (topicRules.length > 0) {
+		lines.push("Topic rules, matched by task rather than file path:");
+		for (const rule of topicRules) {
+			lines.push(`- ${rule.absolutePath} (${rule.source}): ${ruleDescription(rule)}`);
+		}
+		lines.push("");
+	}
+
+	if (patternRules.length > 0) {
+		lines.push("Path-pattern rules, load the matching rule before editing files that match:");
+		for (const rule of patternRules) {
+			const description =
+				rule.descriptionToModel.length > 0 ? ` | ${ruleDescription(rule)}` : "";
+			lines.push(`- ${rule.absolutePath} (${rule.source}): ${rule.patterns.join(", ")}${description}`);
+		}
+	}
+
+	return `\n\n${lines.join("\n")}`;
+}
+
+/** Description-only section for deferred rules whose patterns matched the prompt. */
+function formatDeferredRules(rules: Rule[]): string {
+	if (rules.length === 0) return "";
+	const rows = rules.map(
+		(rule) =>
+			`- ${rule.absolutePath} (${rule.source}): ${rule.patterns.join(", ")} | ${ruleDescription(rule)}`,
+	);
+	return `\n\n## Deferred Claude Rules\n\nThe rules below match paths in this prompt, but only their descriptions are shown. Load each one with the load_claude_rules tool (rules parameter, by name) before editing the matching files.\n\n${rows.join("\n")}`;
 }
 
 function directoryExists(dir: string): boolean {
@@ -454,11 +574,9 @@ function formatDirList(dirs: string[]): string {
 }
 
 function describeRules(loaded: LoadedRules): string {
-	const always = loaded.rules.filter((rule) => rule.alwaysApply).length;
-	const conditional = loaded.rules.filter(
-		(rule) => !rule.alwaysApply && rule.patterns.length > 0,
-	).length;
-	const inactive = loaded.rules.length - always - conditional;
+	const count = (kind: RuleKind) => loaded.rules.filter((rule) => rule.kind === kind).length;
+	const modelDecision = count("deferred") + count("topic");
+	const disabled = count("disabled");
 	const overrides = loaded.overridden.length > 0
 		? `, ${loaded.overridden.length} override(s)`
 		: "";
@@ -470,7 +588,8 @@ function describeRules(loaded: LoadedRules): string {
 			.filter((dir) => directoryExists(dir)),
 	);
 	const from = dirs === "" ? "" : ` from ${dirs}`;
-	return `Claude rules: ${loaded.rules.length} loaded${from} (${always} always, ${conditional} conditional, ${inactive} without patterns${overrides})`;
+	const disabledText = disabled > 0 ? `, ${disabled} disabled` : "";
+	return `Claude rules: ${loaded.rules.length} loaded${from} (${count("always")} always, ${count("conditional")} conditional, ${modelDecision} model-decision${disabledText}${overrides})`;
 }
 
 function truncateForTool(text: string): { text: string; truncated: boolean } {
@@ -727,16 +846,22 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 		let systemPrompt: string | undefined;
 		if (rules.length > 0) {
 			const candidates = extractPathCandidates(event.prompt);
-			const activeRules = matchingRules(rules, candidates);
-			if (activeRules.length > 0) {
-				const reason = candidates.length > 0
-					? `matched prompt paths: ${candidates.join(", ")}`
-					: "alwaysApply rules";
-				systemPrompt =
-					event.systemPrompt +
-					"\n\n" +
-					formatRulesForPrompt(activeRules, reason) +
-					formatRuleIndex(rules);
+			const eagerRules = matchingRules(rules, candidates);
+			const deferred = deferredMatches(rules, candidates);
+			// Topic rules are ungated, so their index lines must reach the model
+			// even when nothing matched the prompt (a fileless prompt included).
+			const hasTopicRules = rules.some((rule) => rule.kind === "topic");
+			if (eagerRules.length > 0 || deferred.length > 0 || hasTopicRules) {
+				const parts: string[] = [];
+				if (eagerRules.length > 0) {
+					const reason = candidates.length > 0
+						? `matched prompt paths: ${candidates.join(", ")}`
+						: "alwaysApply rules";
+					parts.push(formatRulesForPrompt(eagerRules, reason));
+				}
+				parts.push(formatDeferredRules(deferred));
+				parts.push(formatRuleIndex(rules));
+				systemPrompt = `${event.systemPrompt}\n\n${parts.filter(Boolean).join("")}`;
 			}
 		}
 
@@ -949,10 +1074,12 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 		name: "load_claude_rules",
 		label: "Load Claude Rules",
 		description:
-			"Load Markdown rules from global and local .claude/rules and .agents/rules directories matching one or more file paths. Output is truncated to 50KB or 2000 lines.",
-		promptSnippet: "Load global/local .claude/rules and .agents/rules content matching file paths",
+			"Load Markdown rules from global and local .claude/rules and .agents/rules directories. Pass paths to select rules by frontmatter path patterns, or rules to load specific rules by name (relative path like shared/security.md, basename like security.md, or stem like security), including topic rules listed in the Claude rules index. Output is truncated to 50KB or 2000 lines.",
+		promptSnippet:
+			"Load global/local .claude/rules and .agents/rules content by file path or rule name",
 		promptGuidelines: [
 			"Use load_claude_rules before editing or creating files when their paths may match conditional Claude rules.",
+			"Load topic rules by name with the rules parameter when the Claude rules index lists one whose description matches the task.",
 		],
 		parameters: {
 			type: "object",
@@ -962,46 +1089,95 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 					items: { type: "string" },
 					description: "Project-relative or absolute file paths to match against rule frontmatter patterns.",
 				},
-				includeAlways: {
-					type: "boolean",
-					description: "Include alwaysApply rules in addition to path-matched rules. Defaults to true.",
-				},
+			rules: {
+				type: "array",
+				items: { type: "string" },
+				description:
+					"Rule names to load explicitly, bypassing path gating: relative path (shared/security.md), basename (security.md), or stem (security).",
 			},
-			required: ["paths"],
+			includeAlways: {
+				type: "boolean",
+				description: "Include alwaysApply rules in addition to the selected rules. Defaults to true.",
+			},
+		},
 			additionalProperties: false,
 		} as any,
 		async execute(_toolCallId, params) {
-			const input = params as { paths: string[]; includeAlways?: boolean };
-			const candidates = input.paths.map(normalizePathForMatch).filter(Boolean);
+			const input = params as { paths?: string[]; rules?: string[]; includeAlways?: boolean };
+			const candidates = (input.paths ?? []).map(normalizePathForMatch).filter(Boolean);
+			const names = (input.rules ?? []).map((name) => name.trim()).filter(Boolean);
 			const includeAlways = input.includeAlways !== false;
-			const activeRules = matchingRules(rules, candidates).filter(
-				(rule) => includeAlways || !rule.alwaysApply,
-			);
 
-			const ruleDetails: RuleDetail[] = activeRules.map((rule) => ({
-				path: rule.absolutePath,
-				source: rule.source,
-				sourceDir: rule.sourceDir,
-				patterns: rule.patterns,
-				alwaysApply: rule.alwaysApply,
-			}));
-
-			if (activeRules.length === 0) {
-				const emptyDetails: LoadClaudeRulesDetails = { paths: candidates, rules: [] };
+			if (candidates.length === 0 && names.length === 0) {
+				const emptyDetails: LoadClaudeRulesDetails = { paths: [], rules: [] };
 				return {
-					content: [{ type: "text", text: `No Claude rules matched: ${candidates.join(", ")}` }],
+					content: [
+						{
+							type: "text",
+							text: "No paths or rule names given. Pass paths to match frontmatter patterns, or rules to load rules by name.",
+						},
+					],
 					details: emptyDetails,
 				};
 			}
 
-			const result = truncateForTool(
-				formatRulesForPrompt(activeRules, `matched tool paths: ${candidates.join(", ")}`),
+			// Explicit requests bypass the gate: path-matched deferred rules
+			// return their full body, and named loads return any rule that is
+			// not disabled, regardless of patterns.
+			const selected = new Set<Rule>();
+			if (includeAlways) {
+				for (const rule of rules) {
+					if (rule.kind === "always") selected.add(rule);
+				}
+			}
+			for (const rule of rules) {
+				if (
+					(rule.kind === "conditional" || rule.kind === "deferred") &&
+					ruleMatchesCandidates(rule, candidates)
+				) {
+					selected.add(rule);
+				}
+			}
+			for (const name of names) {
+				for (const rule of rules) {
+					if (rule.kind !== "disabled" && ruleMatchesName(rule, name)) selected.add(rule);
+				}
+			}
+			const activeRules = [...selected].sort(
+				(a, b) => a.relativePath.localeCompare(b.relativePath) || a.source.localeCompare(b.source),
 			);
+
+			if (activeRules.length === 0) {
+				const emptyDetails: LoadClaudeRulesDetails = { paths: candidates, rules: [] };
+				const target = [
+					candidates.length > 0 ? `paths: ${candidates.join(", ")}` : "",
+					names.length > 0 ? `names: ${names.join(", ")}` : "",
+				]
+					.filter(Boolean)
+					.join("; ");
+				return {
+					content: [{ type: "text", text: `No Claude rules matched ${target}` }],
+					details: emptyDetails,
+				};
+			}
+
+			const reasons = [
+				candidates.length > 0 ? `matched tool paths: ${candidates.join(", ")}` : "",
+				names.length > 0 ? `matched rule names: ${names.join(", ")}` : "",
+			].filter(Boolean);
+			if (reasons.length === 0) reasons.push("alwaysApply rules");
+			const result = truncateForTool(formatRulesForPrompt(activeRules, reasons.join("; ")));
 
 			const details: LoadClaudeRulesDetails = {
 				paths: candidates,
 				truncated: result.truncated,
-				rules: ruleDetails,
+				rules: activeRules.map((rule) => ({
+					path: rule.absolutePath,
+					source: rule.source,
+					sourceDir: rule.sourceDir,
+					patterns: rule.patterns,
+					kind: rule.kind,
+				})),
 			};
 
 			return {
@@ -1052,11 +1228,30 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 			}
 
 			if (trimmed) {
-				const candidates = trimmed.split(/\s+/).filter(Boolean);
-				const activeRules = matchingRules(rules, candidates);
+				const args = trimmed.split(/\s+/).filter(Boolean);
+				const candidates = args.map(normalizePathForMatch).filter(Boolean);
+				// Args act as both path candidates and rule names, so a human can
+				// preview any rule by name, like the tool's rules parameter.
+				const selected = new Set<Rule>();
+				for (const rule of rules) {
+					if (rule.kind === "always") {
+						selected.add(rule);
+					} else if (
+						(rule.kind === "conditional" || rule.kind === "deferred") &&
+						ruleMatchesCandidates(rule, candidates)
+					) {
+						selected.add(rule);
+					}
+					if (rule.kind !== "disabled" && args.some((arg) => ruleMatchesName(rule, arg))) {
+						selected.add(rule);
+					}
+				}
+				const activeRules = [...selected].sort(
+					(a, b) => a.relativePath.localeCompare(b.relativePath) || a.source.localeCompare(b.source),
+				);
 				const content = activeRules.length > 0
-					? formatRulesForPrompt(activeRules, `matched command paths: ${candidates.join(", ")}`)
-					: `No Claude rules matched: ${candidates.join(", ")}`;
+					? formatRulesForPrompt(activeRules, `matched command args: ${args.join(", ")}`)
+					: `No Claude rules matched: ${args.join(", ")}`;
 				pi.sendMessage({
 					customType: "claude-rules",
 					content,

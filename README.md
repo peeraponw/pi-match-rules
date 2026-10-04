@@ -28,14 +28,15 @@ pi -e ./index.ts
 
 ## Rule format
 
-Rules are Markdown files with YAML-style frontmatter. Supported matching keys:
+Rules are Markdown files with YAML-style frontmatter. Supported keys:
 
 - `alwaysApply: true`
 - `pattern` / `patterns`
 - `path` / `paths`
 - `glob` / `globs`
+- `description_to_model` (a list of strings, switches the rule to lazy delivery)
 
-Example:
+Example of an eagerly injected rule:
 
 ```markdown
 ---
@@ -49,7 +50,34 @@ globs:
 Use strict typing and pytest.
 ```
 
-Rules with `alwaysApply: true` (or no frontmatter at all) are injected every turn. Conditional rules are injected when the user prompt mentions a path matching one of the frontmatter patterns. A rule that has frontmatter but no `alwaysApply` and no patterns is inactive.
+Example of a lazily delivered rule:
+
+```markdown
+---
+globs:
+  - "**/*.py"
+description_to_model:
+  - "Python standards, strict typing and pytest conventions"
+---
+
+# Python Rules
+
+Use strict typing and pytest.
+```
+
+Rules carry two independent axes. Patterns are the gate and decide when a rule becomes visible at all. `description_to_model` is the delivery mode and switches from eager body injection to lazy loading, where the model sees a one-line description and pulls the full body through the `load_claude_rules` tool when the task needs it.
+
+| Frontmatter | Gate | Delivery |
+|------|------|------|
+| Patterns only | Path match | Body injected on match |
+| Patterns plus `description_to_model` | Path match | Description on match, body loaded through the tool |
+| `description_to_model` only | None, always visible | Description in the index, body loaded through the tool |
+| Neither key, without `alwaysApply: false` | None | Body injected every turn |
+| `alwaysApply: true` | None, override | Body injected every turn, even with a description |
+| `alwaysApply: false` without patterns | Disabled | Disabled |
+| No frontmatter | None | Body injected every turn |
+
+Topic rules (a description without patterns) are listed in a Claude rules index appended to the system prompt whenever they exist, even when the prompt mentions no file paths. Pattern-gated lazy rules stay invisible until a matching path shows up in the prompt, and then only their descriptions are shown, with a directive to load the rule before editing the matching files. Index descriptions are truncated to about 160 characters. Since the model decides from the description alone whether to load a rule, write descriptions that state when the rule applies.
 
 Rules are loaded from four directories, in increasing precedence:
 
@@ -64,7 +92,13 @@ Symlinked rule files and directories are followed, so a rules directory entry ca
 
 ## Tool
 
-The extension registers `load_claude_rules`, which the agent can call with file paths discovered during the task. It returns the matching rule contents plus `alwaysApply` rules by default. Tool output is truncated to 50KB or 2000 lines.
+The extension registers `load_claude_rules`, which the agent can call with file paths discovered during the task, or with rule names taken from the Claude rules index.
+
+- `paths` selects rules by frontmatter path patterns and returns full bodies. A pattern-gated lazy rule matched this way returns its body too, since the call is an explicit request.
+- `rules` selects rules by name (relative path like `shared/security.md`, basename like `security.md`, or stem like `security`) and bypasses path gating, so topic and deferred rules load on demand.
+- Always-injected rules are included by default and can be excluded with `includeAlways: false`.
+
+Tool output is truncated to 50KB or 2000 lines.
 
 ## Subdirectory AGENTS.md
 
@@ -80,7 +114,7 @@ pi loads `AGENTS.md` (or `CLAUDE.md`) only from the working directory and its an
 
 - `/claude-rules` show how many rules are loaded.
 - `/claude-rules reload` reload rule files from disk.
-- `/claude-rules <path> [path...]` show the rules matching one or more paths.
+- `/claude-rules <path-or-name> [...]` show the rules matching paths, or load named rules directly to preview any rule, lazy ones included.
 - `/claude-hooks` list every synced hook with its event, matcher, source file, and command.
 - `/claude-hooks reload` reload hooks from the settings files.
 
