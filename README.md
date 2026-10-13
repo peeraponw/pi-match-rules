@@ -18,7 +18,7 @@ This is probably a bloated extension (sorry for that). Let me briefly explain th
 
 This extension allows pi to:
 
-1. Read `~/.claude/rules/**/*.md` and `~/.agents/rules/**/*.md` for user-scope rules, as well as `.claude/rules/**/*.md` and `.agents/rules/**/*.md` for repo-scope rules. So you have a single source of truth for pi, Claude Code, and other agents for rules. In addition, humans can categorize rules easily.
+1. Read `~/.claude/rules/**/*.md`, `~/.agents/rules/**/*.md`, and `~/.pi/agent/rules/**/*.md` for user-scope rules, as well as `.claude/rules/**/*.md` and `.agents/rules/**/*.md` for repo-scope rules. So you have a single source of truth for pi, Claude Code, and other agents for rules. In addition, humans can categorize rules easily.
 2. Read `./**/AGENTS.md` when pi reads or writes in a subdirectory of your repo.
 3. Apply frontmatter patterns for conditional rule loading. For example, you can write `~/.claude/rules/python/testing.md`:
 
@@ -130,10 +130,11 @@ Rules carry two independent axes. Patterns are the gate and decide when a rule b
 
 Topic rules (a description without patterns) are listed in a Claude rules index appended to the system prompt whenever they exist, even when the prompt mentions no file paths. Pattern-gated lazy rules stay invisible until a matching path shows up in the prompt, and then only their descriptions are shown, with a directive to load the rule before editing the matching files. Index descriptions are truncated to about 160 characters. Since the model decides from the description alone whether to load a rule, write descriptions that state when the rule applies.
 
-Rules are loaded from four directories, in increasing precedence:
+Rules are loaded from five directories, in increasing precedence:
 
 - Global: `~/.claude/rules/**/*.md` by default
 - Global: `~/.agents/rules/**/*.md` by default
+- Global: `$PI_CODING_AGENT_DIR/rules/**/*.md` (default `~/.pi/agent/rules`), the pi agent directory, so pi-specific rules live next to your other pi configuration
 - Local: `<project>/.claude/rules/**/*.md`
 - Local: `<project>/.agents/rules/**/*.md`
 
@@ -175,6 +176,7 @@ Environment variables, all optional:
 
 - `PI_CLAUDE_RULES_DIR` overrides the global Claude rules directory (default `~/.claude/rules`).
 - `PI_AGENTS_RULES_DIR` overrides the global agents rules directory (default `~/.agents/rules`).
+- `PI_CODING_AGENT_DIR` overrides the pi agent directory, whose `rules/` subdirectory is read as another global rules source (default `~/.pi/agent`). This is the same variable pi itself uses for its configuration directory.
 - `PI_CLAUDE_SETTINGS_FILE` overrides the global settings file for hooks (default `~/.claude/settings.json`).
 - `PI_CLAUDE_HOOKS_ENABLED=0` disables hook syncing entirely.
 - `PI_SUBDIR_AGENTS_MD=0` disables subdirectory `AGENTS.md` injection.
@@ -182,6 +184,7 @@ Environment variables, all optional:
 ```bash
 PI_CLAUDE_RULES_DIR=~/my-rules pi -e ./index.ts
 PI_AGENTS_RULES_DIR=~/my-agents-rules pi -e ./index.ts
+PI_CODING_AGENT_DIR=~/.custom-pi/agent pi -e ./index.ts
 PI_CLAUDE_SETTINGS_FILE=~/my-settings.json pi -e ./index.ts
 PI_CLAUDE_HOOKS_ENABLED=0 pi -e ./index.ts
 PI_SUBDIR_AGENTS_MD=0 pi -e ./index.ts

@@ -77,6 +77,7 @@ type LoadClaudeRulesDetails = {
 
 const DEFAULT_GLOBAL_CLAUDE_RULES_DIR = "~/.claude/rules";
 const DEFAULT_GLOBAL_AGENTS_RULES_DIR = "~/.agents/rules";
+const DEFAULT_PI_AGENT_DIR = "~/.pi/agent";
 const PATTERN_KEYS = ["pattern", "patterns", "path", "paths", "glob", "globs"];
 const MAX_TOOL_BYTES = 50 * 1024;
 const MAX_TOOL_LINES = 2000;
@@ -377,6 +378,13 @@ function getGlobalAgentsRulesDir(): string {
 	return expandHome(process.env.PI_AGENTS_RULES_DIR ?? DEFAULT_GLOBAL_AGENTS_RULES_DIR);
 }
 
+/** The pi agent dir also serves rules: $PI_CODING_AGENT_DIR/rules, or
+ * ~/.pi/agent/rules by default, mirroring how pi itself resolves its config
+ * directory. */
+function getPiAgentRulesDir(): string {
+	return path.join(expandHome(process.env.PI_CODING_AGENT_DIR ?? DEFAULT_PI_AGENT_DIR), "rules");
+}
+
 function getLocalClaudeRulesDir(cwd: string): string {
 	return path.join(cwd, ".claude", "rules");
 }
@@ -388,11 +396,14 @@ function getLocalAgentsRulesDir(cwd: string): string {
 /**
  * Rule directories in precedence order, lowest first. A rule in a later
  * directory replaces a rule with the same relative path from an earlier one.
+ * The pi agent dir is the highest-precedence global source; repo-local rules
+ * still win over every global directory.
  */
 function getRuleLocations(cwd: string): RuleLocation[] {
 	return [
 		{ dir: getGlobalClaudeRulesDir(), source: "global" },
 		{ dir: getGlobalAgentsRulesDir(), source: "global" },
+		{ dir: getPiAgentRulesDir(), source: "global" },
 		{ dir: getLocalClaudeRulesDir(cwd), source: "local" },
 		{ dir: getLocalAgentsRulesDir(cwd), source: "local" },
 	];
@@ -1074,9 +1085,9 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 		name: "load_claude_rules",
 		label: "Load Claude Rules",
 		description:
-			"Load Markdown rules from global and local .claude/rules and .agents/rules directories. Pass paths to select rules by frontmatter path patterns, or rules to load specific rules by name (relative path like shared/security.md, basename like security.md, or stem like security), including topic rules listed in the Claude rules index. Output is truncated to 50KB or 2000 lines.",
+			"Load Markdown rules from global and local .claude/rules and .agents/rules directories plus the pi agent rules directory ($PI_CODING_AGENT_DIR/rules, default ~/.pi/agent/rules). Pass paths to select rules by frontmatter path patterns, or rules to load specific rules by name (relative path like shared/security.md, basename like security.md, or stem like security), including topic rules listed in the Claude rules index. Output is truncated to 50KB or 2000 lines.",
 		promptSnippet:
-			"Load global/local .claude/rules and .agents/rules content by file path or rule name",
+			"Load global/local .claude/rules, .agents/rules, and pi agent rules content by file path or rule name",
 		promptGuidelines: [
 			"Use load_claude_rules before editing or creating files when their paths may match conditional Claude rules.",
 			"Load topic rules by name with the rules parameter when the Claude rules index lists one whose description matches the task.",
@@ -1217,7 +1228,7 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("claude-rules", {
-		description: "Show or reload global/local .claude/rules and .agents/rules frontmatter-driven rules",
+		description: "Show or reload global/local .claude/rules and .agents/rules plus pi agent dir frontmatter-driven rules",
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
 			if (trimmed === "reload") {

@@ -14,7 +14,7 @@ npm test           # node --test index.test.ts hooks.test.ts
 
 ## Notes
 - The extension is dependency-free at runtime besides pi's extension APIs and Node built-ins.
-- Rules are loaded from global `~/.claude/rules/**/*.md` and `~/.agents/rules/**/*.md`, plus local `.claude/rules/**/*.md` and `.agents/rules/**/*.md`, in increasing precedence.
+- Rules are loaded from global `~/.claude/rules/**/*.md` and `~/.agents/rules/**/*.md`, plus `$PI_CODING_AGENT_DIR/rules/**/*.md` (default `~/.pi/agent/rules`) and local `.claude/rules/**/*.md` and `.agents/rules/**/*.md`, in increasing precedence.
 - `PI_CLAUDE_RULES_DIR` and `PI_AGENTS_RULES_DIR` override the global rules directories.
 - A later directory overrides an earlier one for rules with the same relative path, and a file reachable from two directories loads once.
 - Hooks are synced from `~/.claude/settings.json` plus `.claude/settings.json` and `.claude/settings.local.json`; `hooks.ts` holds the Claude hook bridge and `index.ts` wires it to pi events.

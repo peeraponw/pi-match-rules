@@ -417,6 +417,7 @@ test("subdirAgentsEnabled: PI_SUBDIR_AGENTS_MD=0 disables, default enables", () 
 test("extension injects agents-dir rules alongside claude-dir rules", async () => {
 	const claudeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-claude-"));
 	const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-agents-"));
+	const piAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-piagent-"));
 	const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-project-"));
 	const handlers: Record<string, (event: unknown, ctx: unknown) => Promise<unknown>> = {};
 	const fake = {
@@ -429,10 +430,12 @@ test("extension injects agents-dir rules alongside claude-dir rules", async () =
 	};
 	const previousClaudeDir = process.env.PI_CLAUDE_RULES_DIR;
 	const previousAgentsDir = process.env.PI_AGENTS_RULES_DIR;
+	const previousPiAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const previousHooksEnabled = process.env.PI_CLAUDE_HOOKS_ENABLED;
 	try {
 		process.env.PI_CLAUDE_RULES_DIR = claudeDir;
 		process.env.PI_AGENTS_RULES_DIR = agentsDir;
+		process.env.PI_CODING_AGENT_DIR = piAgentDir;
 		// Keep the machine's real settings.json hooks out of the test run.
 		process.env.PI_CLAUDE_HOOKS_ENABLED = "0";
 		fs.writeFileSync(
@@ -468,10 +471,90 @@ test("extension injects agents-dir rules alongside claude-dir rules", async () =
 		else process.env.PI_CLAUDE_RULES_DIR = previousClaudeDir;
 		if (previousAgentsDir === undefined) delete process.env.PI_AGENTS_RULES_DIR;
 		else process.env.PI_AGENTS_RULES_DIR = previousAgentsDir;
+		if (previousPiAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousPiAgentDir;
 		if (previousHooksEnabled === undefined) delete process.env.PI_CLAUDE_HOOKS_ENABLED;
 		else process.env.PI_CLAUDE_HOOKS_ENABLED = previousHooksEnabled;
 		fs.rmSync(claudeDir, { recursive: true, force: true });
 		fs.rmSync(agentsDir, { recursive: true, force: true });
+		fs.rmSync(piAgentDir, { recursive: true, force: true });
+		fs.rmSync(project, { recursive: true, force: true });
+	}
+});
+
+test("extension injects pi agent dir rules and lets them override other globals", async () => {
+	const claudeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-claude-"));
+	const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-agents-"));
+	const piAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-piagent-"));
+	const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-project-"));
+	const handlers: Record<string, (event: unknown, ctx: unknown) => Promise<unknown>> = {};
+	const fake = {
+		on(name: string, handler: (event: never, ctx: never) => Promise<unknown>) {
+			handlers[name] = handler as (event: unknown, ctx: unknown) => Promise<unknown>;
+		},
+		registerTool: () => undefined,
+		registerCommand: () => undefined,
+		sendMessage: () => undefined,
+	};
+	const previousClaudeDir = process.env.PI_CLAUDE_RULES_DIR;
+	const previousAgentsDir = process.env.PI_AGENTS_RULES_DIR;
+	const previousPiAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const previousHooksEnabled = process.env.PI_CLAUDE_HOOKS_ENABLED;
+	try {
+		process.env.PI_CLAUDE_RULES_DIR = claudeDir;
+		process.env.PI_AGENTS_RULES_DIR = agentsDir;
+		process.env.PI_CODING_AGENT_DIR = piAgentDir;
+		// Keep the machine's real settings.json hooks out of the test run.
+		process.env.PI_CLAUDE_HOOKS_ENABLED = "0";
+		fs.writeFileSync(
+			path.join(claudeDir, "shared.md"),
+			"---\nalwaysApply: true\n---\n\n\nclaude shared body",
+		);
+		fs.writeFileSync(
+			path.join(claudeDir, "claude-only.md"),
+			"---\nalwaysApply: true\n---\n\n\nclaude only body",
+		);
+		fs.mkdirSync(path.join(piAgentDir, "rules"), { recursive: true });
+		fs.writeFileSync(
+			path.join(piAgentDir, "rules", "shared.md"),
+			"---\nalwaysApply: true\n---\n\n\npi agent shared body",
+		);
+
+		claudeRuleMatcher(fake as unknown as Parameters<typeof claudeRuleMatcher>[0]);
+		const ctx = {
+			cwd: project,
+			ui: { notify: () => undefined, setStatus: () => undefined },
+			sessionManager: { getSessionId: () => "test", getSessionFile: () => undefined },
+		};
+		await handlers["session_start"]?.({ reason: "new" }, ctx);
+		const result = (await handlers["before_agent_start"]?.(
+			{ prompt: "hello", systemPrompt: "base" },
+			ctx,
+		)) as { systemPrompt?: string } | undefined;
+
+		assert.ok(result?.systemPrompt, "returns a patched system prompt");
+		assert.match(result.systemPrompt ?? "", /pi agent shared body/);
+		assert.match(result.systemPrompt ?? "", /claude only body/);
+		assert.ok(
+			!(result.systemPrompt ?? "").includes("claude shared body"),
+			"pi agent dir rule overrides the claude-dir rule with the same relative path",
+		);
+		assert.ok(
+			(result.systemPrompt ?? "").includes(`### ${path.join(piAgentDir, "rules", "shared.md")}`),
+			"overriding rule is attributed to the pi agent rules dir",
+		);
+	} finally {
+		if (previousClaudeDir === undefined) delete process.env.PI_CLAUDE_RULES_DIR;
+		else process.env.PI_CLAUDE_RULES_DIR = previousClaudeDir;
+		if (previousAgentsDir === undefined) delete process.env.PI_AGENTS_RULES_DIR;
+		else process.env.PI_AGENTS_RULES_DIR = previousAgentsDir;
+		if (previousPiAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousPiAgentDir;
+		if (previousHooksEnabled === undefined) delete process.env.PI_CLAUDE_HOOKS_ENABLED;
+		else process.env.PI_CLAUDE_HOOKS_ENABLED = previousHooksEnabled;
+		fs.rmSync(claudeDir, { recursive: true, force: true });
+		fs.rmSync(agentsDir, { recursive: true, force: true });
+		fs.rmSync(piAgentDir, { recursive: true, force: true });
 		fs.rmSync(project, { recursive: true, force: true });
 	}
 });
@@ -531,6 +614,7 @@ test("extension appends subdirectory AGENTS.md to tool results once per file", a
 test("extension: model-decision rules defer bodies and load on demand", async () => {
 	const claudeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-claude-"));
 	const agentsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-agents-"));
+	const piAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-piagent-"));
 	const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-project-"));
 	const handlers: Record<string, (event: unknown, ctx: unknown) => Promise<unknown>> = {};
 	type LoadTool = {
@@ -550,10 +634,12 @@ test("extension: model-decision rules defer bodies and load on demand", async ()
 	};
 	const previousClaudeDir = process.env.PI_CLAUDE_RULES_DIR;
 	const previousAgentsDir = process.env.PI_AGENTS_RULES_DIR;
+	const previousPiAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const previousHooksEnabled = process.env.PI_CLAUDE_HOOKS_ENABLED;
 	try {
 		process.env.PI_CLAUDE_RULES_DIR = claudeDir;
 		process.env.PI_AGENTS_RULES_DIR = agentsDir;
+		process.env.PI_CODING_AGENT_DIR = piAgentDir;
 		process.env.PI_CLAUDE_HOOKS_ENABLED = "0";
 		fs.writeFileSync(
 			path.join(claudeDir, "topic.md"),
@@ -626,10 +712,13 @@ test("extension: model-decision rules defer bodies and load on demand", async ()
 		else process.env.PI_CLAUDE_RULES_DIR = previousClaudeDir;
 		if (previousAgentsDir === undefined) delete process.env.PI_AGENTS_RULES_DIR;
 		else process.env.PI_AGENTS_RULES_DIR = previousAgentsDir;
+		if (previousPiAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousPiAgentDir;
 		if (previousHooksEnabled === undefined) delete process.env.PI_CLAUDE_HOOKS_ENABLED;
 		else process.env.PI_CLAUDE_HOOKS_ENABLED = previousHooksEnabled;
 		fs.rmSync(claudeDir, { recursive: true, force: true });
 		fs.rmSync(agentsDir, { recursive: true, force: true });
+		fs.rmSync(piAgentDir, { recursive: true, force: true });
 		fs.rmSync(project, { recursive: true, force: true });
 	}
 });
