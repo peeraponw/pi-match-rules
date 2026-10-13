@@ -6,6 +6,57 @@ A pi extension that syncs Claude Code configuration into pi:
 - Injects subdirectory `AGENTS.md` / `CLAUDE.md` files that pi itself never loads, because pi only reads context files from the working directory and its ancestors.
 - Runs Claude Code hooks from `~/.claude/settings.json` (and project-local `.claude/settings.json` / `.claude/settings.local.json`) on the matching pi events, so hooks like Orca telemetry or voice-lint work identically in both agents.
 
+## Why
+
+This is probably a bloated extension (sorry for that). Let me briefly explain the default behavior of pi:
+
+- pi only reads `~/.pi/agent/AGENTS.md` for user-scope rules
+- pi only reads `./AGENTS.md` for repo-scope rules
+- pi cannot read subdirectory `AGENTS.md`
+- pi cannot apply path-based conditional rule loading (Claude Code, gh copilot, and opencode do)
+- pi cannot apply model-decision-based conditional rule loading (antigravity does)
+
+This extension allows pi to:
+
+1. Read `~/.claude/rules/**/*.md` and `~/.agents/rules/**/*.md` for user-scope rules, as well as `.claude/rules/**/*.md` and `.agents/rules/**/*.md` for repo-scope rules. So you have a single source of truth for pi, Claude Code, and other agents for rules. In addition, humans can categorize rules easily.
+2. Read `./**/AGENTS.md` when pi reads or writes in a subdirectory of your repo.
+3. Apply frontmatter patterns for conditional rule loading. For example, you can write `~/.claude/rules/python/testing.md`:
+
+   ```markdown
+   ---
+   paths:
+     - "**/test_*.py"
+   ---
+
+   # Pytest rules
+
+   - Write tests to cover happy path and edge cases
+   - Avoid writing tautology tests
+   ```
+
+   This rule is injected to pi only when it reads or writes `**/test_*.py`. The supported keywords are any of `pattern`, `patterns`, `path`, `paths`, `glob`, `globs` (for compatibility with Claude Code, gh copilot, and opencode, each of which supports different keywords). Without one of these frontmatter keywords, the rule is always loaded.
+
+4. Load conditional rules lazily. For example, you can write `~/.claude/rules/migrations.md`:
+
+   ```markdown
+   ---
+   pattern:
+     - "migrations/**"
+     - "schema.sql"
+   description_to_model:
+     - "Database migration safety rules, zero-downtime column drops, and idempotent SQL scripts"
+   ---
+
+   # Database Migration Rules
+
+   Never drop a column in the same release it is removed from code.
+   All migrations must be backward-compatible with the previous application version.
+   ```
+
+   This rule will never appear to pi unless it touches files matching the provided pattern. Once touched, only the `description_to_model` content appears. Pi can decide whether its current task is relevant to this rule; if yes, it further loads the rule's body. `pattern` (and friends) and `description_to_model` can be used independently.
+
+This sounds like a skill, but I would rather keep skill as a set of actions to perform a task, while a rule is simply suggestions for the agent's current action or task.
+
 ## Install
 
 This repository is a pi package. Install it from this checkout for all pi sessions:
