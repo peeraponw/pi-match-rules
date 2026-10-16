@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { BeforeAgentStartEvent, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	type HookDecision,
 	type HookDefinition,
@@ -19,6 +19,7 @@ import {
 	hookMatcherMatches,
 	interpretHookOutcome,
 	loadHookSettings,
+	projectHookSettingsFiles,
 	runHookCommand,
 	textOfContent,
 	toClaudeToolInput,
@@ -762,8 +763,8 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 		return describeRules(loadedRules);
 	}
 
-	function reloadHooks(cwd: string): LoadedHooks {
-		loadedHooks = loadHookSettings(getHookSettingsFiles(cwd));
+	function reloadHooks(cwd: string, projectTrusted: boolean): LoadedHooks {
+		loadedHooks = loadHookSettings(getHookSettingsFiles(cwd, { projectTrusted }));
 		return loadedHooks;
 	}
 
@@ -784,15 +785,37 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 		}
 	}
 
+	/**
+	 * Project-local hook settings define executable commands, so they load
+	 * only for trusted projects, matching how pi gates its own protected
+	 * project resources. Tell the user what was skipped and how to enable it.
+	 */
+	function notifyUntrustedProjectHooks(
+		cwd: string,
+		ui: { notify(message: string, type?: "info" | "warning" | "error"): void },
+	): void {
+		const skipped = projectHookSettingsFiles(cwd).filter((file) => fs.existsSync(file));
+		if (skipped.length === 0) return;
+		ui.notify(
+			`claude-hooks: project settings not loaded (untrusted project): ${formatDirList(skipped)}. Trust the project (/trust), then run /claude-hooks reload.`,
+			"warning",
+		);
+	}
+
 	async function runClaudeHookSet(
 		definitions: HookDefinition[],
 		claudeEvent: string,
 		extra: Record<string, unknown>,
 		ctx: HookBridgeContext,
 	): Promise<HookDecision> {
-		if (loadedHooks.disabled || definitions.length === 0) {
-			return aggregateHookDecisions([]);
+		if (loadedHooks.disabled) return aggregateHookDecisions([]);
+		// Claude runs async hooks in the background: they never hold up the
+		// event and their output never reaches the model.
+		const syncDefs = definitions.filter((definition) => definition.spec.async !== true);
+		for (const definition of definitions) {
+			if (definition.spec.async === true) runAsyncHook(definition, claudeEvent, extra, ctx);
 		}
+		if (syncDefs.length === 0) return aggregateHookDecisions([]);
 		const payload = buildHookPayload(
 			{
 				sessionId: ctx.sessionManager.getSessionId(),
@@ -804,11 +827,59 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 		);
 		// Claude runs all matching hooks in parallel.
 		const outcomes = await Promise.all(
-			definitions.map((definition) => runHookCommand(definition.spec, payload, ctx.cwd)),
+			syncDefs.map((definition) => runHookCommand(definition.spec, payload, ctx.cwd)),
 		);
 		return aggregateHookDecisions(
 			outcomes.map((outcome) => interpretHookOutcome(claudeEvent, outcome)),
 		);
+	}
+
+	/** Fire-and-forget, like Claude's async hooks. Failures log to stderr. */
+	function runAsyncHook(
+		definition: HookDefinition,
+		claudeEvent: string,
+		extra: Record<string, unknown>,
+		ctx: HookBridgeContext,
+	): void {
+		const payload = buildHookPayload(
+			{
+				sessionId: ctx.sessionManager.getSessionId(),
+				transcriptPath: ctx.sessionManager.getSessionFile(),
+				cwd: ctx.cwd,
+			},
+			claudeEvent,
+			extra,
+		);
+		void runHookCommand(definition.spec, payload, ctx.cwd)
+			.then((outcome) => {
+				if (
+					outcome.spawnFailed ||
+					outcome.timedOut ||
+					(outcome.exitCode !== null && outcome.exitCode !== 0)
+				) {
+					const detail = outcome.errorMessage
+					?? (outcome.timedOut ? "timed out" : `exit ${outcome.exitCode}`);
+					console.error(
+						`pi-match-rules: async ${claudeEvent} hook failed (${definition.spec.command}): ${detail}`,
+				);
+				}
+			})
+			.catch((error: unknown) => {
+				console.error(
+					`pi-match-rules: async ${claudeEvent} hook crashed (${definition.spec.command}): ${(error as Error).message}`,
+				);
+			});
+	}
+
+	/**
+	 * Prompt text for either run trigger. User events carry the raw prompt;
+	 * custom events (pi.sendMessage with triggerTurn) carry a custom message
+	 * whose text blocks serve the same role for path matching.
+	 */
+	function runPromptText(event: BeforeAgentStartEvent): string {
+		if (event.messageType === "user") return event.prompt;
+		const content = event.message.content;
+		return typeof content === "string" ? content : textOfContent(content);
 	}
 
 	function lastAssistantText(messages: unknown[]): string {
@@ -833,7 +904,8 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 			ctx.ui.notify(`Failed to load Claude rules: ${(error as Error).message}`, "error");
 		}
 
-		reloadHooks(ctx.cwd);
+		reloadHooks(ctx.cwd, ctx.isProjectTrusted());
+		if (!ctx.isProjectTrusted()) notifyUntrustedProjectHooks(ctx.cwd, ctx.ui);
 		ctx.ui.setStatus(
 			"claude-hooks",
 			loadedHooks.disabled ? "off" : `${loadedHooks.hooks.length} hooks`,
@@ -855,8 +927,9 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		let systemPrompt: string | undefined;
+		const promptText = runPromptText(event);
 		if (rules.length > 0) {
-			const candidates = extractPathCandidates(event.prompt);
+			const candidates = extractPathCandidates(promptText);
 			const eagerRules = matchingRules(rules, candidates);
 			const deferred = deferredMatches(rules, candidates);
 			// Topic rules are ungated, so their index lines must reach the model
@@ -876,11 +949,12 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 			}
 		}
 
-		// UserPromptSubmit hooks, plus context queued by SessionStart hooks.
+		// UserPromptSubmit hooks fire for user prompts only, plus context queued
+		// by SessionStart hooks, which flushes for custom-triggered runs too.
 		const contextParts = [...sessionContextQueue];
 		sessionContextQueue = [];
 		const promptDefs = hooksFor("UserPromptSubmit");
-		if (promptDefs.length > 0 && !loadedHooks.disabled) {
+		if (event.messageType === "user" && promptDefs.length > 0 && !loadedHooks.disabled) {
 			try {
 				const decision = await runClaudeHookSet(
 					promptDefs,
@@ -948,6 +1022,9 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 			pendingToolContext.set(event.toolCallId, decision.resultAppendix);
 		}
 		if (decision.blockReason !== undefined) {
+			// A blocked call never produces a tool result, so drop any context
+			// another hook queued for it.
+			pendingToolContext.delete(event.toolCallId);
 			return { block: true, reason: decision.blockReason };
 		}
 		if (decision.askReason !== undefined && ctx.hasUI) {
@@ -955,7 +1032,10 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 				"Claude hook",
 				`${decision.askReason}\n\nAllow this ${event.toolName} call?`,
 			);
-			if (!allowed) return { block: true, reason: decision.askReason };
+			if (!allowed) {
+				pendingToolContext.delete(event.toolCallId);
+				return { block: true, reason: decision.askReason };
+			}
 		}
 	});
 
@@ -994,7 +1074,9 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 				surfaceDecision(decision, ctx, claudeEvent);
 				if (decision.resultAppendix !== undefined) {
 					hookAppendix =
-					hookAppendix === "" ? decision.resultAppendix : `${hookAppendix}\n\n${decision.resultAppendix}`;
+					hookAppendix === ""
+						? decision.resultAppendix
+						: `${hookAppendix}\n\n${decision.resultAppendix}`;
 				}
 				markError = decision.markResultError;
 			} catch (error) {
@@ -1011,6 +1093,11 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 		if (extraBlocks.length === 0) return;
 		return {
 			content: [...content, ...extraBlocks],
+			// Replacing content without structuredContent would drop the
+			// machine-readable result of tools that declare an outputSchema.
+			...(event.structuredContent !== undefined
+				? { structuredContent: event.structuredContent }
+				: {}),
 			...(markError ? { isError: true } : {}),
 		};
 	});
@@ -1042,6 +1129,28 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 		} catch (error) {
 			ctx.ui.notify(`claude-hooks TeammateIdle failed: ${(error as Error).message}`, "error");
 		}
+	});
+
+	pi.on("session_before_compact", async (event, ctx) => {
+		if (loadedHooks.disabled) return;
+		const trigger = claudeCompactTrigger(event.reason);
+		const defs = hooksFor("PreCompact").filter((hook) =>
+			hookMatcherMatches(hook.matcher, [trigger]),
+		);
+		if (defs.length === 0) return;
+		try {
+			const decision = await runClaudeHookSet(
+				defs,
+				"PreCompact",
+				{ trigger, custom_instructions: event.customInstructions ?? "" },
+				ctx,
+			);
+			surfaceDecision(decision, ctx, "PreCompact");
+		} catch (error) {
+			ctx.ui.notify(`claude-hooks PreCompact failed: ${(error as Error).message}`, "error");
+		}
+		// Claude's PreCompact cannot block compaction, so nothing is returned
+		// and pi's cancellable session_before_compact proceeds.
 	});
 
 	pi.on("session_compact", async (event, ctx) => {
@@ -1100,17 +1209,17 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 					items: { type: "string" },
 					description: "Project-relative or absolute file paths to match against rule frontmatter patterns.",
 				},
-			rules: {
-				type: "array",
-				items: { type: "string" },
-				description:
-					"Rule names to load explicitly, bypassing path gating: relative path (shared/security.md), basename (security.md), or stem (security).",
+				rules: {
+					type: "array",
+					items: { type: "string" },
+					description:
+						"Rule names to load explicitly, bypassing path gating: relative path (shared/security.md), basename (security.md), or stem (security).",
+				},
+				includeAlways: {
+					type: "boolean",
+					description: "Include alwaysApply rules in addition to the selected rules. Defaults to true.",
+				},
 			},
-			includeAlways: {
-				type: "boolean",
-				description: "Include alwaysApply rules in addition to the selected rules. Defaults to true.",
-			},
-		},
 			additionalProperties: false,
 		} as any,
 		async execute(_toolCallId, params) {
@@ -1203,7 +1312,9 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
 			if (trimmed === "reload") {
-				loadedHooks = loadHookSettings(getHookSettingsFiles(ctx.cwd));
+				const trusted = ctx.isProjectTrusted();
+				loadedHooks = loadHookSettings(getHookSettingsFiles(ctx.cwd, { projectTrusted: trusted }));
+				if (!trusted) notifyUntrustedProjectHooks(ctx.cwd, ctx.ui);
 				ctx.ui.setStatus(
 					"claude-hooks",
 					loadedHooks.disabled ? "off" : `${loadedHooks.hooks.length} hooks`,
@@ -1221,9 +1332,9 @@ export default function claudeRuleMatcher(pi: ExtensionAPI) {
 			}
 			pi.sendMessage({
 				customType: "claude-hooks",
-			content: lines.join("\n"),
-			display: true,
-		});
+				content: lines.join("\n"),
+				display: true,
+			});
 		},
 	});
 

@@ -62,6 +62,7 @@ export const PI_EVENT_BY_CLAUDE_EVENT: Record<string, string> = {
 	PostToolUseFailure: "tool_result",
 	Stop: "agent_end",
 	TeammateIdle: "agent_settled",
+	PreCompact: "session_before_compact",
 	PostCompact: "session_compact",
 	SessionEnd: "session_shutdown",
 };
@@ -80,20 +81,37 @@ export function getGlobalSettingsFile(): string {
 	return expandHome(process.env.PI_CLAUDE_SETTINGS_FILE ?? DEFAULT_GLOBAL_SETTINGS_FILE);
 }
 
-export function getHookSettingsFiles(cwd: string): string[] {
+export function projectHookSettingsFiles(cwd: string): string[] {
 	return [
-		getGlobalSettingsFile(),
 		path.join(cwd, ".claude", "settings.json"),
 		path.join(cwd, ".claude", "settings.local.json"),
 	];
 }
 
-export function parseHookSettings(content: string): Record<string, HookGroupSpec[]> {
-	const parsed = JSON.parse(content) as unknown;
+export function getHookSettingsFiles(cwd: string, options?: { projectTrusted?: boolean }): string[] {
+	// Project settings files define executable commands, so they stay behind
+	// pi's project trust, like pi's own protected project resources.
+	const projectTrusted = options?.projectTrusted ?? true;
+	return [getGlobalSettingsFile(), ...(projectTrusted ? projectHookSettingsFiles(cwd) : [])];
+}
+
+/** Parse settings JSON, throwing a useful error through to the caller's
+ * per-file error recording. */
+function parseSettingsRoot(content: string): Record<string, unknown> {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(content);
+	} catch (error) {
+		throw new Error(`settings is not valid JSON: ${(error as Error).message}`);
+	}
 	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
 		throw new Error("settings root is not a JSON object");
 	}
-	const hooks = (parsed as Record<string, unknown>).hooks;
+	return parsed as Record<string, unknown>;
+}
+
+function hookGroupsFromRoot(root: Record<string, unknown>): Record<string, HookGroupSpec[]> {
+	const hooks = root.hooks;
 	if (hooks === undefined || hooks === null) return {};
 	if (typeof hooks !== "object" || Array.isArray(hooks)) {
 		throw new Error("settings.hooks is not an object");
@@ -110,11 +128,15 @@ export function parseHookSettings(content: string): Record<string, HookGroupSpec
 							(handler): handler is Record<string, unknown> =>
 								handler !== null && typeof handler === "object",
 						)
-					: [],
-			}));
+								: [],
+				}));
 		if (parsedGroups.length > 0) result[event] = parsedGroups;
 	}
 	return result;
+}
+
+export function parseHookSettings(content: string): Record<string, HookGroupSpec[]> {
+	return hookGroupsFromRoot(parseSettingsRoot(content));
 }
 
 export function hooksEnabled(): boolean {
@@ -146,15 +168,17 @@ export function loadHookSettings(files: string[]): LoadedHooks {
 		}
 		result.sourceFiles.push(file);
 
+		let root: Record<string, unknown>;
 		let settings: Record<string, HookGroupSpec[]>;
 		try {
-			settings = parseHookSettings(content);
+			root = parseSettingsRoot(content);
+			settings = hookGroupsFromRoot(root);
 		} catch (error) {
 			result.errors.push(`${file}: ${(error as Error).message}`);
 			continue;
 		}
 
-		if ((JSON.parse(content) as { disableAllHooks?: unknown }).disableAllHooks === true) {
+		if (root.disableAllHooks === true) {
 			result.disabled = true;
 		}
 
@@ -362,7 +386,9 @@ export function claudeSessionEndReason(piReason: string): string {
 	}
 }
 
-// pi session_compact reason -> Claude PostCompact trigger.
+// pi session_compact or session_before_compact reason -> Claude trigger.
+// Claude knows "manual" and "auto"; pi's threshold and overflow both map to
+// "auto".
 export function claudeCompactTrigger(piReason: string): string {
 	return piReason === "manual" ? "manual" : "auto";
 }

@@ -4,7 +4,7 @@ A pi extension that syncs Claude Code configuration into pi:
 
 - Loads Markdown rules from global and project-local `.claude/rules` and `.agents/rules` directories and injects the relevant rules into pi's system prompt.
 - Injects subdirectory `AGENTS.md` / `CLAUDE.md` files that pi itself never loads, because pi only reads context files from the working directory and its ancestors.
-- Runs Claude Code hooks from `~/.claude/settings.json` (and project-local `.claude/settings.json` / `.claude/settings.local.json`) on the matching pi events, so hooks like Orca telemetry or voice-lint work identically in both agents.
+- Runs Claude Code hooks from `~/.claude/settings.json` (and project-local `.claude/settings.json` / `.claude/settings.local.json`) on the matching pi events, so hooks like Orca telemetry or voice-lint work identically in both agents. Project-local hooks require a trusted project.
 
 ## Why
 
@@ -157,7 +157,7 @@ Tool output is truncated to 50KB or 2000 lines.
 pi loads `AGENTS.md` (or `CLAUDE.md`) only from the working directory and its ancestors, so context files in subdirectories never reach the session. This extension fills that gap. When a tool touches a path under a subdirectory that has its own context file, the file's content is appended to that tool's result, once per file per session.
 
 - Candidates per directory, in priority order, match pi's own list (`AGENTS.override.md`, then `AGENTS.md` / `AGENTS.MD`, then `CLAUDE.md` / `CLAUDE.MD`), and only the first present file in a directory is used.
-- Applies to `read`, `write`, `edit`, `ls`, `find`, and `grep` calls that carry a `path` input under the session cwd. `bash` commands are not inspected, since their working directories cannot be resolved reliably.
+- Applies to `read`, `write`, `edit`, `ls`, `find`, and `grep` calls that carry a `path` input under the session cwd. Tools registered by other extensions, even ones that take a `path` input, are not inspected. `bash` commands are not inspected either, since their working directories cannot be resolved reliably.
 - Paths outside the session cwd are ignored. The cwd's own context file is skipped because pi already loaded it at startup.
 - A chain of nested files is injected together, ordered from the directory closest to the cwd outward.
 - Appended output is truncated to 50KB or 2000 lines. `/claude-rules reload` clears the injected set, so edited files can inject again later in the session.
@@ -202,7 +202,15 @@ The extension also syncs Claude Code hooks into pi. It reads the `hooks` key fro
 - Project: `<project>/.claude/settings.json`
 - Local: `<project>/.claude/settings.local.json`
 
-Hooks from all files run (identical handlers are deduplicated), matching Claude's merge behavior. Only `type: "command"` hooks run; `http`, `mcp_tool`, `prompt`, and `agent` handlers are skipped, as are handlers using the `if` permission-rule filter. A `disableAllHooks: true` setting in any loaded file disables them.
+Hooks from all files run (identical handlers are deduplicated), matching Claude's merge behavior. Only `type: "command"` hooks run; `http`, `mcp_tool`, `prompt`, and `agent` handlers are skipped, as are handlers using the `if` permission-rule filter. A `disableAllHooks: true` setting in any loaded file disables them. Handlers marked `async: true` run in the background, like Claude's async hooks. They never block the event, their output is ignored, and failures are logged to stderr.
+
+### Project trust
+
+Hooks are shell commands, so the project-local settings files load only when pi trusts the project (`ctx.isProjectTrusted()`), mirroring how pi gates its own protected project resources. In an untrusted project only the global settings file is read, and a warning names the skipped files. Grant trust with `/trust`, then run `/claude-hooks reload`.
+
+Rule files and subdirectory `AGENTS.md` are Markdown, not commands. They reach the model as instructions, the same untrusted-input channel as pi's own context files, so they load regardless of project trust.
+
+Hooks run through `sh -c` (or `bash` when the handler sets `shell: "bash"`), so hook syncing needs a Unix-like system.
 
 ### Event mapping
 
@@ -213,12 +221,13 @@ Hooks from all files run (identical handlers are deduplicated), matching Claude'
 | `PreToolUse` | `tool_call` | can block or patch the tool input |
 | `PostToolUse` | `tool_result` | only when the tool succeeded |
 | `PostToolUseFailure` | `tool_result` | only when the tool errored, with `error` text |
-| `Stop` | `agent_end` | sends `stop_hook_active: false` and `last_assistant_message` |
+| `Stop` | `agent_end` | sends `stop_hook_active: false` and `last_assistant_message`; also fires when a run was aborted, since pi's `agent_end` carries no aborted flag |
 | `TeammateIdle` | `agent_settled` | |
+| `PreCompact` | `session_before_compact` | `trigger` mapped like PostCompact; sends `custom_instructions`; cannot cancel compaction, matching Claude |
 | `PostCompact` | `session_compact` | `trigger` is `manual` or `auto`; sends `compact_summary` |
 | `SessionEnd` | `session_shutdown` | reason mapped to `clear`, `resume`, or `other` |
 
-Other Claude events (Notification, SubagentStart, PermissionRequest, FileChanged, and the rest) have no pi equivalent and are skipped; `/claude-hooks` lists them.
+Other Claude events (Notification, SubagentStop, PermissionRequest, FileChanged, and the rest) have no pi equivalent and are skipped; `/claude-hooks` lists them.
 
 ### Payload and tool translation
 

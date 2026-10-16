@@ -16,7 +16,9 @@ import {
 	emptyHookDecision,
 	fromClaudeToolInput,
 	getGlobalSettingsFile,
+	getHookSettingsFiles,
 	hookMatcherMatches,
+	PI_EVENT_BY_CLAUDE_EVENT,
 	interpretHookOutcome,
 	loadHookSettings,
 	parseHookSettings,
@@ -626,5 +628,33 @@ test("describeHooks: summarizes loaded hooks, unmapped events, and skips", () =>
 		assert.match(text, /1 handler\(s\) skipped/);
 	} finally {
 		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("getHookSettingsFiles: project files load only for trusted projects", () => {
+	const cwd = "/tmp/some-project";
+	const trusted = getHookSettingsFiles(cwd);
+	assert.equal(trusted.length, 3);
+	assert.deepEqual(trusted.slice(1), [
+		path.join(cwd, ".claude", "settings.json"),
+		path.join(cwd, ".claude", "settings.local.json"),
+	]);
+
+	const untrusted = getHookSettingsFiles(cwd, { projectTrusted: false });
+	assert.equal(untrusted.length, 1);
+	assert.equal(untrusted[0], getGlobalSettingsFile());
+});
+
+test("PI_EVENT_BY_CLAUDE_EVENT: PreCompact maps to session_before_compact", () => {
+	assert.equal(PI_EVENT_BY_CLAUDE_EVENT["PreCompact"], "session_before_compact");
+	assert.equal(PI_EVENT_BY_CLAUDE_EVENT["PostCompact"], "session_compact");
+});
+
+test("parseHookSettings: invalid JSON error names the problem", () => {
+	try {
+		parseHookSettings("{nope");
+		assert.fail("expected throw");
+	} catch (error) {
+		assert.match((error as Error).message, /not valid JSON/);
 	}
 });

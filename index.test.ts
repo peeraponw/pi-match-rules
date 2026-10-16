@@ -100,6 +100,22 @@ test("parseMarkdownRule: description_to_model accepts list, inline array, and sc
 	assert.equal(scalar.frontmatter.description_to_model, "one line");
 });
 
+type CtxDouble = {
+	cwd: string;
+	ui: { notify: (message: string, type?: "info" | "warning" | "error") => void; setStatus: () => void };
+	sessionManager: { getSessionId: () => string; getSessionFile: () => string | undefined };
+	isProjectTrusted: () => boolean;
+};
+
+function makeCtx(cwd: string, trusted = true): CtxDouble {
+	return {
+		cwd,
+		ui: { notify: () => undefined, setStatus: () => undefined },
+		sessionManager: { getSessionId: () => "test", getSessionFile: () => undefined },
+		isProjectTrusted: () => trusted,
+	};
+}
+
 function makeRule(relativePath: string): Parameters<typeof ruleMatchesName>[0] {
 	return {
 		absolutePath: `/rules/${relativePath}`,
@@ -448,14 +464,10 @@ test("extension injects agents-dir rules alongside claude-dir rules", async () =
 		);
 
 		claudeRuleMatcher(fake as unknown as Parameters<typeof claudeRuleMatcher>[0]);
-		const ctx = {
-			cwd: project,
-			ui: { notify: () => undefined, setStatus: () => undefined },
-			sessionManager: { getSessionId: () => "test", getSessionFile: () => undefined },
-		};
+		const ctx = makeCtx(project);
 		await handlers["session_start"]?.({ reason: "new" }, ctx);
 		const result = (await handlers["before_agent_start"]?.(
-			{ prompt: "please edit src/main.rs", systemPrompt: "base" },
+			{ messageType: "user", prompt: "please edit src/main.rs", systemPrompt: "base" },
 			ctx,
 		)) as { systemPrompt?: string } | undefined;
 
@@ -521,14 +533,10 @@ test("extension injects pi agent dir rules and lets them override other globals"
 		);
 
 		claudeRuleMatcher(fake as unknown as Parameters<typeof claudeRuleMatcher>[0]);
-		const ctx = {
-			cwd: project,
-			ui: { notify: () => undefined, setStatus: () => undefined },
-			sessionManager: { getSessionId: () => "test", getSessionFile: () => undefined },
-		};
+		const ctx = makeCtx(project);
 		await handlers["session_start"]?.({ reason: "new" }, ctx);
 		const result = (await handlers["before_agent_start"]?.(
-			{ prompt: "hello", systemPrompt: "base" },
+			{ messageType: "user", prompt: "hello", systemPrompt: "base" },
 			ctx,
 		)) as { systemPrompt?: string } | undefined;
 
@@ -580,11 +588,7 @@ test("extension appends subdirectory AGENTS.md to tool results once per file", a
 		claudeRuleMatcher(fake as unknown as Parameters<typeof claudeRuleMatcher>[0]);
 		assert.ok(onToolResult !== undefined, "extension subscribes to tool_result");
 
-		const ctx = {
-			cwd: root,
-			ui: { notify: () => undefined, setStatus: () => undefined },
-			sessionManager: { getSessionId: () => "test", getSessionFile: () => undefined },
-		};
+		const ctx = makeCtx(root);
 		const event = {
 			type: "tool_result",
 			toolName: "read",
@@ -657,16 +661,12 @@ test("extension: model-decision rules defer bodies and load on demand", async ()
 		claudeRuleMatcher(fake as unknown as Parameters<typeof claudeRuleMatcher>[0]);
 		const loadTool = tools.find((tool) => tool.name === "load_claude_rules");
 		assert.ok(loadTool, "extension registers load_claude_rules");
-		const ctx = {
-			cwd: project,
-			ui: { notify: () => undefined, setStatus: () => undefined },
-			sessionManager: { getSessionId: () => "test", getSessionFile: () => undefined },
-		};
+		const ctx = makeCtx(project);
 		await handlers["session_start"]?.({ reason: "new" }, ctx);
 
 		const runPrompt = async (prompt: string): Promise<string> => {
 			const result = (await handlers["before_agent_start"]?.(
-				{ prompt, systemPrompt: "base" },
+				{ messageType: "user", prompt, systemPrompt: "base" },
 			ctx,
 			)) as { systemPrompt?: string } | undefined;
 			return result?.systemPrompt ?? "";
@@ -719,6 +719,295 @@ test("extension: model-decision rules defer bodies and load on demand", async ()
 		fs.rmSync(claudeDir, { recursive: true, force: true });
 		fs.rmSync(agentsDir, { recursive: true, force: true });
 		fs.rmSync(piAgentDir, { recursive: true, force: true });
+		fs.rmSync(project, { recursive: true, force: true });
+	}
+});
+
+// ---------------------------------------------------------------------------
+// before_agent_start union handling, structuredContent, hook trust gating
+// ---------------------------------------------------------------------------
+
+function makeHandlers(): {
+	handlers: Record<string, (event: unknown, ctx: unknown) => Promise<unknown>>;
+	commands: Record<string, { handler: (args: string, ctx: unknown) => Promise<void> }>;
+} {
+	const handlers: Record<string, (event: unknown, ctx: unknown) => Promise<unknown>> = {};
+	const commands: Record<string, { handler: (args: string, ctx: unknown) => Promise<void> }> = {};
+	const fake = {
+		on(name: string, handler: (event: never, ctx: never) => Promise<unknown>) {
+			handlers[name] = handler as (event: unknown, ctx: unknown) => Promise<unknown>;
+		},
+		registerTool: () => undefined,
+		registerCommand(name: string, options: { handler: (args: string, ctx: never) => Promise<void> }) {
+			commands[name] = options as { handler: (args: string, ctx: unknown) => Promise<void> };
+		},
+		sendMessage: () => undefined,
+	};
+	claudeRuleMatcher(fake as unknown as Parameters<typeof claudeRuleMatcher>[0]);
+	return { handlers, commands };
+}
+
+function isolateRulesEnv(claudeDir: string, project: string): Record<string, string | undefined> {
+	const previous = {
+		claudeDir: process.env.PI_CLAUDE_RULES_DIR,
+		agentsDir: process.env.PI_AGENTS_RULES_DIR,
+		piAgentDir: process.env.PI_CODING_AGENT_DIR,
+		hooksEnabled: process.env.PI_CLAUDE_HOOKS_ENABLED,
+		settingsFile: process.env.PI_CLAUDE_SETTINGS_FILE,
+	};
+	process.env.PI_CLAUDE_RULES_DIR = claudeDir;
+	process.env.PI_AGENTS_RULES_DIR = path.join(project, "no-agents-rules");
+	process.env.PI_CODING_AGENT_DIR = path.join(project, "no-pi-agent");
+	process.env.PI_CLAUDE_HOOKS_ENABLED = "0";
+	return previous;
+}
+
+function restoreRulesEnv(previous: Record<string, string | undefined>): void {
+	for (const [key, value] of Object.entries(previous)) {
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+}
+
+test("extension: custom-triggered runs match rules from message text without crashing", async () => {
+	const claudeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-claude-"));
+	const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rules-project-"));
+	const previous = isolateRulesEnv(claudeDir, project);
+	try {
+		fs.writeFileSync(
+			path.join(claudeDir, "py.md"),
+			'---\npatterns:\n  - "**/*.py"\n---\n\nPY RULE BODY',
+		);
+		fs.writeFileSync(path.join(claudeDir, "rs.md"), '---\npatterns:\n  - "**/*.rs"\n---\n\nRS RULE BODY');
+
+		const { handlers } = makeHandlers();
+		const ctx = makeCtx(project);
+		await handlers["session_start"]?.({ reason: "new" }, ctx);
+
+		// Custom message with text blocks: path candidates come from the text.
+		const blocks = (
+			await handlers["before_agent_start"]?.(
+				{
+					messageType: "custom",
+					message: {
+						customType: "steer",
+						content: [{ type: "text", text: "please edit src/main.py now" }],
+						display: false,
+					},
+					systemPrompt: "base",
+				},
+				ctx,
+			)
+		) as { systemPrompt?: string } | undefined;
+		assert.ok(blocks?.systemPrompt, "custom run patches the system prompt");
+		assert.match(blocks.systemPrompt ?? "", /PY RULE BODY/);
+		assert.ok(!(blocks.systemPrompt ?? "").includes("RS RULE BODY"));
+
+		// Custom message with plain string content works too.
+		const text = (await handlers["before_agent_start"]?.(
+			{
+				messageType: "custom",
+				message: { customType: "steer", content: "refactor src/lib.rs please", display: false },
+				systemPrompt: "base",
+			},
+			ctx,
+		)) as { systemPrompt?: string } | undefined;
+		assert.match(text?.systemPrompt ?? "", /RS RULE BODY/);
+	} finally {
+		restoreRulesEnv(previous);
+		fs.rmSync(claudeDir, { recursive: true, force: true });
+		fs.rmSync(project, { recursive: true, force: true });
+	}
+});
+
+test("extension: tool_result patch preserves structuredContent", async () => {
+	const root = makeContextTree();
+	try {
+		const { handlers } = makeHandlers();
+		const ctx = makeCtx(root);
+		await handlers["session_start"]?.({ reason: "new" }, ctx);
+		const event = {
+			type: "tool_result",
+			toolName: "read",
+			toolCallId: "t1",
+			input: { path: path.join(root, "sub", "deep", "file.ts") },
+			content: [{ type: "text", text: "file body" }],
+			structuredContent: { found: true, score: 42 },
+			isError: false,
+			details: undefined,
+		};
+		const result = (await handlers["tool_result"]?.(event, ctx)) as
+			| { content: Array<{ type: string; text?: string }>; structuredContent?: unknown }
+			| undefined;
+		assert.ok(result, "returns a content patch");
+		assert.match(result.content.at(-1)?.text ?? "", /\[Subdirectory AGENTS\.md\]/);
+		assert.deepEqual(result.structuredContent, { found: true, score: 42 });
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+async function waitForFile(file: string, ms = 3000): Promise<string | undefined> {
+	const deadline = Date.now() + ms;
+	for (;;) {
+		try {
+			return fs.readFileSync(file, "utf8");
+		} catch {
+			if (Date.now() >= deadline) return undefined;
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+	}
+}
+
+test("extension: hook bridge runs settings hooks with trust gating", async () => {
+	const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-hooks-project-"));
+	const globalSettings = path.join(project, "global-settings.json");
+	const globalSessionMarker = path.join(project, "global-session.txt");
+	const localSessionMarker = path.join(project, "local-session.txt");
+	const promptMarker = path.join(project, "prompt.txt");
+	const asyncMarker = path.join(project, "async-pretool.txt");
+	const preCompactMarker = path.join(project, "precompact.txt");
+	const postToolMarker = path.join(project, "posttool.txt");
+
+	fs.writeFileSync(
+		globalSettings,
+		JSON.stringify({
+			hooks: {
+				SessionStart: [{ hooks: [{ type: "command", command: `cat > ${globalSessionMarker}` }] }],
+			},
+		}),
+	);
+	fs.mkdirSync(path.join(project, ".claude"), { recursive: true });
+	fs.writeFileSync(
+		path.join(project, ".claude", "settings.json"),
+		JSON.stringify({
+			hooks: {
+				SessionStart: [{ hooks: [{ type: "command", command: `cat > ${localSessionMarker}` }] }],
+				UserPromptSubmit: [{ hooks: [{ type: "command", command: `cat > ${promptMarker}` }] }],
+				PreToolUse: [
+					{
+						matcher: "Read",
+						hooks: [{ type: "command", command: `cat > ${asyncMarker}`, async: true }],
+					},
+				],
+				PreCompact: [{ hooks: [{ type: "command", command: `cat > ${preCompactMarker}` }] }],
+				PostToolUse: [{ hooks: [{ type: "command", command: `cat > ${postToolMarker}` }] }],
+			},
+		}),
+	);
+
+	const previous: Record<string, string | undefined> = {
+		PI_CLAUDE_SETTINGS_FILE: process.env.PI_CLAUDE_SETTINGS_FILE,
+		PI_CLAUDE_HOOKS_ENABLED: process.env.PI_CLAUDE_HOOKS_ENABLED,
+		PI_CLAUDE_RULES_DIR: process.env.PI_CLAUDE_RULES_DIR,
+		PI_AGENTS_RULES_DIR: process.env.PI_AGENTS_RULES_DIR,
+		PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
+	};
+	process.env.PI_CLAUDE_SETTINGS_FILE = globalSettings;
+	delete process.env.PI_CLAUDE_HOOKS_ENABLED;
+	process.env.PI_CLAUDE_RULES_DIR = path.join(project, "no-rules");
+	process.env.PI_AGENTS_RULES_DIR = path.join(project, "no-agents");
+	process.env.PI_CODING_AGENT_DIR = path.join(project, "no-pi");
+	try {
+		const notifications: string[] = [];
+		const untrustedCtx = {
+			...makeCtx(project, false),
+			ui: {
+				notify: (message: string) => notifications.push(message),
+				setStatus: () => undefined,
+			},
+		};
+
+		// Untrusted project: global hooks run, project-local hooks do not.
+		const untrusted = makeHandlers();
+		await untrusted.handlers["session_start"]?.({ reason: "new" }, untrustedCtx);
+		const globalPayload = await waitForFile(globalSessionMarker);
+		assert.ok(globalPayload, "global settings hook ran");
+		assert.match(globalPayload, /"hook_event_name":"SessionStart"/);
+		assert.equal(await waitForFile(localSessionMarker, 200), undefined, "project hook skipped");
+		assert.ok(
+			notifications.some((message) => message.includes("untrusted project")),
+			"skipped project settings are reported",
+		);
+
+		// Reloading with a trusted context loads the project hooks.
+		const trusted = makeHandlers();
+		await trusted.handlers["session_start"]?.({ reason: "new" }, makeCtx(project));
+		const localPayload = await waitForFile(localSessionMarker);
+		assert.ok(localPayload, "project settings hook ran once trusted");
+		assert.match(localPayload, /"hook_event_name":"SessionStart"/);
+
+		// PreCompact runs on session_before_compact with trigger and
+		// custom_instructions, and does not cancel compaction.
+		const compactResult = await trusted.handlers["session_before_compact"]?.(
+			{
+				type: "session_before_compact",
+				reason: "manual",
+				customInstructions: "keep tests green",
+			},
+			makeCtx(project),
+		);
+		assert.equal(compactResult, undefined, "PreCompact cannot block compaction");
+		const preCompactPayload = await waitForFile(preCompactMarker);
+		assert.ok(preCompactPayload, "PreCompact hook ran");
+		assert.match(preCompactPayload, /"hook_event_name":"PreCompact"/);
+		assert.match(preCompactPayload, /"trigger":"manual"/);
+		assert.match(preCompactPayload, /"custom_instructions":"keep tests green"/);
+
+		// UserPromptSubmit fires for user prompts only.
+		await trusted.handlers["before_agent_start"]?.(
+			{ messageType: "user", prompt: "hello world", systemPrompt: "base" },
+			makeCtx(project),
+		);
+		const promptPayload = await waitForFile(promptMarker);
+		assert.ok(promptPayload, "UserPromptSubmit ran for a user prompt");
+		assert.match(promptPayload, /"prompt":"hello world"/);
+		fs.rmSync(promptMarker);
+		await trusted.handlers["before_agent_start"]?.(
+			{
+				messageType: "custom",
+				message: { customType: "steer", content: "continue", display: false },
+				systemPrompt: "base",
+			},
+			makeCtx(project),
+		);
+		assert.equal(
+			await waitForFile(promptMarker, 500),
+			undefined,
+			"UserPromptSubmit does not fire for custom-triggered runs",
+		);
+
+		// Async PreToolUse hooks run in the background without blocking.
+		const callStarted = Date.now();
+		const toolCallResult = await trusted.handlers["tool_call"]?.(
+			{ type: "tool_call", toolName: "read", toolCallId: "c1", input: { path: "/tmp/x" } },
+			makeCtx(project),
+		);
+		assert.equal(toolCallResult, undefined, "async hook does not block the call");
+		assert.ok(Date.now() - callStarted < 1500, "tool_call returned without waiting");
+		const asyncPayload = await waitForFile(asyncMarker);
+		assert.ok(asyncPayload, "async PreToolUse hook ran in the background");
+		assert.match(asyncPayload, /"hook_event_name":"PreToolUse"/);
+		assert.match(asyncPayload, /"tool_name":"Read"/);
+
+		// PostToolUse receives the translated tool_input and response.
+		await trusted.handlers["tool_result"]?.(
+			{
+				type: "tool_result",
+				toolName: "read",
+				toolCallId: "c1",
+				input: { path: "/tmp/x" },
+				content: [{ type: "text", text: "body" }],
+				isError: false,
+				details: undefined,
+			},
+			makeCtx(project),
+		);
+		const postPayload = await waitForFile(postToolMarker);
+		assert.ok(postPayload, "PostToolUse hook ran");
+		assert.match(postPayload, /"file_path":"\/tmp\/x"/, "path is translated to file_path");
+	} finally {
+		restoreRulesEnv(previous);
 		fs.rmSync(project, { recursive: true, force: true });
 	}
 });
